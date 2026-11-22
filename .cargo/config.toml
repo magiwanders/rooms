@@ -1,0 +1,3 @@
+[env]
+# tests touch the single global engine state
+RUST_TEST_THREADS = "1"

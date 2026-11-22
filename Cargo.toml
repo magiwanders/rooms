@@ -1,0 +1,16 @@
+[package]
+name = "rooms"
+version = "0.1.0"
+edition = "2021"
+
+# No dependencies on purpose: the renderer is a hand-written raytracer and the
+# browser glue is a handful of extern "C" exports read from plain JS.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
