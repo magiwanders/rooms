@@ -399,7 +399,7 @@ canvas.addEventListener('mousedown', (e) => {
   }
   if (e.shiftKey && e.button === 0) { mode = 'shift'; shiftMoved = 0; return; } // click: lines, drag: erase
   const t = X.tile_begin(...C); // on the floor: toggle a mirror tile, dragging paints the same onto more tiles
-  if (t) { if (t === 3) msg('mirrors too far apart'); mode = 'tiles'; return; }
+  if (t) { if (t === 3) msg('too many mirror tiles'); mode = 'tiles'; return; }
   if (!X.grip_begin(...C)) return;
   pushDir = e.button === 2 ? -1 : 1;
   mode = 'repeat';
@@ -498,10 +498,9 @@ function render() {
   gl.uniform1i(L.uHoverN, u[37]);
   gl.uniform3f(L.uTileHover, u[39], u[46], u[47]);
   gl.uniform1i(L.uMirOff, u[176]);
-  gl.uniform1i(L.uMirI0, u[177]);
-  gl.uniform1i(L.uMirJ0, u[178]);
-  gl.uniform1i(L.uMirW, u[179]);
-  gl.uniform1i(L.uMirH, u[180]);
+  gl.uniform1i(L.uMirN, u[177]);
+  gl.uniform3f(L.uSunTo, u[181], u[182], u[183]);
+  gl.uniform2f(L.uSunSeen, u[184], u[185]);
   gl.uniform4f(L.uPreview, u[40], u[41], u[42], u[43]);
   gl.uniform2f(L.uPreview2, u[44], u[45]);
   gl.uniform4fv(L.uWin, u.subarray(192, 192 + 16 * 32));

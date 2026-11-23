@@ -68,10 +68,10 @@ const INF: f32 = 1e30;
 /// Uniform block layout (floats), mirrored in web/main.js.
 const U_LEN: usize = 192 + 16 * MAX_WINS; // windows from 192 on, 16 floats each
 /// Floor tiles are TILE x TILE metres (the grout lines in the shader match). Any tile
-/// can be toggled into a mirror; the mirror mask is sent as a box of at most
-/// MIRROR_SPAN x MIRROR_SPAN tiles.
+/// can be toggled into a mirror; the mirror tiles are sent as a sorted list (the shader
+/// binary-searches it), so how far apart they are doesn't matter, only how many.
 const TILE: f32 = 0.6;
-const MIRROR_SPAN: i32 = 512;
+const MAX_MIRRORS: usize = 200_000;
 const MIRROR_R: f32 = 0.85; // how much light a mirror tile reflects
 /// Largest window area: (WIN_SIZE_PER_M x the height of its centre)^2, i.e. 1 m^2 at 2 m,
 /// growing with the square of the height so the largest window looks about the same on
@@ -946,23 +946,14 @@ impl State {
     fn ground_tile(&self, sx: f32, sy: f32) -> Option<(i32, i32)> {
         self.pick(sx, sy).filter(|h| h.is_ground()).map(|h| State::tile_of(h.p))
     }
-    /// Make a tile a mirror (on) or plain floor; false if it would make the mirror area
-    /// too large to send. No-op (true) if it already is.
+    /// Make a tile a mirror (on) or plain floor; false if there are already MAX_MIRRORS.
+    /// No-op (true) if it already is.
     fn set_tile(&mut self, t: (i32, i32), on: bool) -> bool {
         if self.mirrors.contains(&t) == on {
             return true;
         }
-        if on && !self.mirrors.is_empty() {
-            let (mut i0, mut i1, mut j0, mut j1) = (t.0, t.0, t.1, t.1);
-            for &(i, j) in &self.mirrors {
-                i0 = i0.min(i);
-                i1 = i1.max(i);
-                j0 = j0.min(j);
-                j1 = j1.max(j);
-            }
-            if i1 - i0 >= MIRROR_SPAN || j1 - j0 >= MIRROR_SPAN {
-                return false;
-            }
+        if on && self.mirrors.len() >= MAX_MIRRORS {
+            return false;
         }
         let before = self.snap();
         if on {
@@ -1321,6 +1312,43 @@ impl State {
         out
     }
 
+    /// How much of the sun's disc the eye sees through a window, directly and as a
+    /// reflection in a mirror tile (0..1 each), for the glare.
+    fn sun_seen(&self, to_sun: V) -> (f32, f32) {
+        if self.wins.is_empty() {
+            return (0.0, 0.0);
+        }
+        let (a, b) = {
+            let t = if to_sun.x.abs() > 0.5 { v(0.0, 1.0, 0.0) } else { v(1.0, 0.0, 0.0) };
+            let a = t.cross(to_sun).norm();
+            (a, to_sun.cross(a))
+        };
+        let through = |o: V, d: V| -> bool {
+            match self.trace(o, d, INF) {
+                Some(h) => self.window_at(&h).is_some() && self.grid.sun_clear(h.p + d * 2e-3, d),
+                None => false,
+            }
+        };
+        let offs = [(0.0, 0.0), (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0), (0.7, 0.7), (-0.7, -0.7), (0.7, -0.7)];
+        let (mut direct, mut mirrored) = (0, 0);
+        for (x, y) in offs {
+            let d = (to_sun + a * (0.015 * x) + b * (0.015 * y)).norm();
+            if through(self.pos, d) {
+                direct += 1;
+            }
+            // reflected: down to a mirror tile, then up toward the sun
+            let dm = v(d.x, -d.y, d.z);
+            if dm.y < 0.0 {
+                if let Some(h) = self.trace(self.pos, dm, INF) {
+                    if h.is_ground() && self.is_mirror(h.p) && through(h.p + v(0.0, 1e-3, 0.0), d) {
+                        mirrored += 1;
+                    }
+                }
+            }
+        }
+        (direct as f32 / offs.len() as f32, mirrored as f32 / offs.len() as f32)
+    }
+
     /// What the crosshair is on, as the region's plane + rectangles.
     fn make_hover(&self) -> Vec<f32> {
         if self.hover.0 < 0.0 {
@@ -1436,19 +1464,19 @@ impl State {
             u[37] = ((self.hover_desc.len() - 3) / 4) as f32;
         }
         u[36] = hover_off as f32;
-        if !self.mirrors.is_empty() {
-            let i0 = self.mirrors.iter().map(|t| t.0).min().unwrap();
-            let i1 = self.mirrors.iter().map(|t| t.0).max().unwrap();
-            let j0 = self.mirrors.iter().map(|t| t.1).min().unwrap();
-            let j1 = self.mirrors.iter().map(|t| t.1).max().unwrap();
-            let (w, h) = ((i1 - i0 + 1) as usize, (j1 - j0 + 1) as usize);
-            let off = d.len();
-            d.resize(off + w * h, 0.0);
-            for &(i, j) in &self.mirrors {
-                d[off + (i - i0) as usize + (j - j0) as usize * w] = 1.0;
-            }
-            u[176..181].copy_from_slice(&[off as f32, i0 as f32, j0 as f32, w as f32, h as f32]);
+        // mirror tiles: (i, j) pairs sorted by (j, i), for a binary search in the shader
+        let mut tiles: Vec<(i32, i32)> = self.mirrors.iter().map(|&(i, j)| (j, i)).collect();
+        tiles.sort_unstable();
+        u[176] = d.len() as f32;
+        u[177] = tiles.len() as f32;
+        for (j, i) in tiles {
+            d.extend_from_slice(&[i as f32, j as f32]);
         }
+        // the sun as seen from where you stand: directly through a window, or reflected
+        // in a mirror tile (fraction of a few rays across the sun's disc that get through)
+        let to_sun = -sun_dir();
+        let (direct, mirrored) = self.sun_seen(to_sun);
+        u[181..186].copy_from_slice(&[to_sun.x, to_sun.y, to_sun.z, direct, mirrored]);
         if let Some((i, j)) = self.tile_hover {
             u[39] = 1.0;
             u[46] = i as f32;
@@ -2649,6 +2677,49 @@ mod tests {
         assert_eq!(push(0.5, 0.5, 2440.0), 1); // up to 613 m
         aim(v(0.5, *st().grid.c[1].last().unwrap(), 0.5));
         assert_eq!(push(0.5, 0.5, 8.0), 3, "can't go past {MAX_HEIGHT} m (615 m)");
+    }
+
+    #[test]
+    fn mirrors_far_apart_are_fine() {
+        setup(0.0, 0.0);
+        st().mirrors.insert((0, 0));
+        assert!(st().set_tile((2000, -1500), true), "a tile 1.2 km away is fine");
+        st().w = 16;
+        st().h = 9;
+        st().frame(16, 9);
+        let u = st().ubuf.clone();
+        assert_eq!(u[177], 2.0, "two tiles sent, not a 2000 x 1500 box");
+    }
+
+    #[test]
+    fn looking_at_the_sun_through_the_window() {
+        setup(0.0, 0.0);
+        let to_sun = -sun_dir();
+        // stand where the line toward the sun leaves through the north window
+        let w = st().wins[0].clone();
+        let c = w.point(0.5, 0.5);
+        let t = (c.y - EYE) / to_sun.y;
+        st().pos = v(c.x - to_sun.x * t, EYE, c.z - to_sun.z * t);
+        assert!(st().grid.free_at(st().pos));
+        let (direct, _) = st().sun_seen(to_sun);
+        assert!(direct > 0.9, "the sun is in full view: {direct}");
+        // block it from outside with a wing of the room: no glare
+        let g = &mut st().grid;
+        for (a, x) in [(0, -4.0), (0, 4.0), (1, 6.0), (1, 12.0), (2, -6.0), (2, -3.0)] {
+            g.insert_cut(a, x).unwrap();
+        }
+        let (i0, i1) = (g.find_cut(0, -4.0).unwrap(), g.find_cut(0, 4.0).unwrap());
+        let (j0, j1) = (g.find_cut(1, 6.0).unwrap(), g.find_cut(1, 12.0).unwrap());
+        let (k0, k1) = (g.find_cut(2, -6.0).unwrap(), g.find_cut(2, -3.0).unwrap());
+        for i in i0..i1 {
+            for j in j0..j1 {
+                for k in k0..k1 {
+                    let ix = g.idx([i, j, k]);
+                    g.occ[ix] = 1;
+                }
+            }
+        }
+        assert_eq!(st().sun_seen(to_sun).0, 0.0);
     }
 
     #[test]

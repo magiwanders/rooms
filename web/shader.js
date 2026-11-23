@@ -27,7 +27,9 @@ uniform ivec3 uN, uCutOff, uCamCell; // cut counts, their offsets in uData, came
 uniform int uNPlanes, uPlaneOff;     // plane table: (axis, sign, pos, nu, nv, off, -, -)
 uniform vec4 uHover;                 // on, axis, sign, pos
 uniform int uHoverOff, uHoverN;      // rects (u0, u1, v0, v1) in uData
-uniform int uMirOff, uMirI0, uMirJ0, uMirW, uMirH; // mirror floor tiles: a w x h mask in uData
+uniform int uMirOff, uMirN;          // mirror floor tiles: uMirN (i, j) pairs in uData, sorted by (j, i)
+uniform vec3 uSunTo;                 // direction toward the sun
+uniform vec2 uSunSeen;               // how much of the sun the eye sees: through a window, in a mirror
 uniform vec3 uTileHover;             // on, i, j: the floor tile under the crosshair
 uniform vec4 uPreview;               // on (1: both lines, 2: vertical only, below 2 m), axis, sign, pos
 uniform vec2 uPreview2;              // u, v
@@ -133,10 +135,23 @@ bool sunClear(vec3 o, vec3 d) {
 }
 
 bool isMirror(vec3 p) {
-  if (uMirW == 0) return false;
-  int i = int(floor(p.x / TILE)) - uMirI0, j = int(floor(p.z / TILE)) - uMirJ0;
-  if (i < 0 || j < 0 || i >= uMirW || j >= uMirH) return false;
-  return D(uMirOff + i + j * uMirW) > 0.5;
+  if (uMirN == 0) return false;
+  int ti = int(floor(p.x / TILE)), tj = int(floor(p.z / TILE));
+  int lo = 0, hi = uMirN - 1;
+  while (lo <= hi) {
+    int mid = (lo + hi) >> 1;
+    int mi = int(D(uMirOff + 2 * mid)), mj = int(D(uMirOff + 2 * mid + 1));
+    if (mi == ti && mj == tj) return true;
+    if (mj < tj || (mj == tj && mi < ti)) lo = mid + 1; else hi = mid - 1;
+  }
+  return false;
+}
+
+// Looking at the sun: a blinding disc with a glare veil around it (c = cosine of the
+// angle between the view and the sun).
+vec3 glare(float c) {
+  c = max(c, 0.0);
+  return SUNCOL * (40.0 * smoothstep(0.99955, 0.9997, c) + 6.0 * pow(c, 64.0) + 1.5 * pow(c, 8.0));
 }
 
 float hitSign(Hit h, vec3 d) { return d[h.axis] > 0.0 ? -1.0 : 1.0; }
@@ -188,7 +203,7 @@ vec3 direct(vec3 p, vec3 n, ivec3 c) {
       }
     }
     // sun reflected off a mirror tile: from p down to the floor, then up to the sun
-    if (uMirW > 0) {
+    if (uMirN > 0) {
       vec3 lr = vec3(ld.x, -ld.y, ld.z);  // toward the sun's mirror image (downward)
       float cr = dot(n, lr);
       if (cr > 0.0 && lr.y < -1e-4 && p.y > 1e-3) {
@@ -328,7 +343,7 @@ vec3 shafts(vec3 o, vec3 d, float thit) {
     // shafts of sunlight reflected up off mirror tiles. Unfolded through the floor, the
     // reflected beam comes straight from the window's mirror image below the ground, so
     // its prism can be clipped exactly like the direct beam's, at any distance.
-    if (uMirW > 0 && ld[ax] * ws < -1e-4) {
+    if (uMirN > 0 && ld[ax] * ws < -1e-4) {
       vec3 bm = vec3(beam.x, -beam.y, beam.z), lr = -bm;  // reflected beam goes up; lr goes back down to the mirror
       float ipos = ax == 1 ? -wpos : wpos;                 // image window plane
       vec4 ir = va == 1 ? vec4(r.x, r.y, -r.w, -r.z) : r;  // wall windows: heights flip under the floor
@@ -405,7 +420,11 @@ void main() {
   rnd(); rnd();
   vec2 sc = (vec2(pix) + vec2(rnd(), rnd())) / uRes;
   vec3 d = normalize(uF + uR * ((2.0 * sc.x - 1.0) * uTan) + uU * ((2.0 * sc.y - 1.0) * uTan * uAspect));
-  vec3 L = min(radiance(uPos, d), vec3(40.0)); // clamp rare fireflies
+  vec3 L = radiance(uPos, d);
+  // the sun, if it is in view: through a window, or reflected in a mirror tile
+  if (uSunSeen.x > 0.0) L += uSunSeen.x * glare(dot(d, uSunTo));
+  if (uSunSeen.y > 0.0) L += uSunSeen.y * MIRROR_R * glare(dot(d, vec3(uSunTo.x, -uSunTo.y, uSunTo.z)));
+  L = min(L, vec3(40.0)); // clamp rare fireflies
   vec3 prev = texelFetch(uPrev, pix, 0).rgb;
   outColor = vec4(mix(prev, L, uAlpha), 1.0);
 }`;
