@@ -347,6 +347,56 @@ impl Grid {
         }
     }
 
+    /// Sunlight from outside: does the ray from `o` (just outside a window) along `d`
+    /// leave the grid without passing through any free cell, i.e. any other part of
+    /// the room? A wing of the room standing in the way shades the window.
+    fn sun_clear(&self, o: V, d: V) -> bool {
+        // enter the grid's bounding box if starting outside it
+        let (mut t0, mut t1) = (0.0f32, INF);
+        for a in 0..3 {
+            let (lo, hi) = (self.c[a][0], self.c[a][self.c[a].len() - 1]);
+            let da = d.get(a);
+            if da.abs() < 1e-9 {
+                if o.get(a) < lo || o.get(a) > hi {
+                    return true;
+                }
+            } else {
+                let (mut ta, mut tb) = ((lo - o.get(a)) / da, (hi - o.get(a)) / da);
+                if ta > tb {
+                    std::mem::swap(&mut ta, &mut tb);
+                }
+                t0 = t0.max(ta);
+                t1 = t1.min(tb);
+            }
+        }
+        if t1 <= t0 {
+            return true;
+        }
+        let o = o + d * (t0 + 1e-4);
+        let Some(mut c) = self.cell_at(o) else { return true };
+        let mut tn = [INF; 3];
+        for a in 0..3 {
+            let da = d.get(a);
+            if da > 1e-9 {
+                tn[a] = (self.c[a][c[a] + 1] - o.get(a)) / da;
+            } else if da < -1e-9 {
+                tn[a] = (self.c[a][c[a]] - o.get(a)) / da;
+            }
+        }
+        loop {
+            if self.free(c) {
+                return false;
+            }
+            let m = if tn[0] < tn[1] { if tn[0] < tn[2] { 0 } else { 2 } } else if tn[1] < tn[2] { 1 } else { 2 };
+            let fwd = d.get(m) > 0.0;
+            if (fwd && c[m] + 1 >= self.n(m)) || (!fwd && c[m] == 0) {
+                return true;
+            }
+            if fwd { c[m] += 1 } else { c[m] -= 1 }
+            tn[m] = if fwd { (self.c[m][c[m] + 1] - o.get(m)) / d.get(m) } else { (self.c[m][c[m]] - o.get(m)) / d.get(m) };
+        }
+    }
+
     /// Is (iu, iv) a face cell of the plane at cut k on `axis` with normal sign s?
     fn is_face(&self, axis: usize, s: f32, k: usize, iu: usize, iv: usize) -> bool {
         let (ua, va) = uva(axis);
@@ -1099,6 +1149,9 @@ impl State {
             for k in 0..if cw > 0.0 { VPL_SUN } else { 0 } {
                 let fu = ((k % side) as f32 + rnd(&mut r)) / side as f32;
                 let fv = ((k / side) as f32 + rnd(&mut r)) / side as f32;
+                if !self.grid.sun_clear(w.point(fu, fv) - nin * 2e-3, -beam) {
+                    continue; // another part of the room shades this bit of the window
+                }
                 if let Some(h) = self.trace(w.point(fu, fv) + nin * 2e-3, beam, INF) {
                     let pw = SUN * w.area() * cw / VPL_SUN as f32 * BOUNCE;
                     out.push(Vpl { p: h.p + h.n * 2e-3, n: h.n, power: SUNCOL.mulv(albedo(&h)) * pw });
@@ -2172,6 +2225,36 @@ mod tests {
         grip_end();
         assert!(!free(v(1.4, 1.6, 0.6)), "the gripped half now sticks out 50 cm into the room");
         assert!(free(v(1.4, 1.6, -0.6)), "the other half of the wall did not move");
+    }
+
+    #[test]
+    fn a_wing_of_the_room_shades_the_window() {
+        setup(0.0, 0.0);
+        let sun_vpls = |s: &State| {
+            let w = &s.wins[0];
+            let nin = unit(w.axis, w.s);
+            (0..16).filter(|k| s.grid.sun_clear(w.point((*k % 4) as f32 / 4.0 + 0.125, (*k / 4) as f32 / 4.0 + 0.125) - nin * 2e-3, -w.beam())).count()
+        };
+        assert_eq!(sun_vpls(st()), 16, "nothing outside: full sun");
+        // the sun comes from above and from -z (behind the north window): build a tall wing
+        // out there by pushing the west wall's upper part far out and then north
+        // (simplest: carve free cells directly in the grid where the sun ray passes)
+        let g = &mut st().grid;
+        for (a, x) in [(0, -4.0), (0, 4.0), (1, 6.0), (1, 12.0), (2, -6.0), (2, -3.0)] {
+            g.insert_cut(a, x).unwrap();
+        }
+        let (i0, i1) = (g.find_cut(0, -4.0).unwrap(), g.find_cut(0, 4.0).unwrap());
+        let (j0, j1) = (g.find_cut(1, 6.0).unwrap(), g.find_cut(1, 12.0).unwrap());
+        let (k0, k1) = (g.find_cut(2, -6.0).unwrap(), g.find_cut(2, -3.0).unwrap());
+        for i in i0..i1 {
+            for j in j0..j1 {
+                for k in k0..k1 {
+                    let ix = g.idx([i, j, k]);
+                    g.occ[ix] = 1;
+                }
+            }
+        }
+        assert_eq!(sun_vpls(st()), 0, "the wing above and behind the window blocks the sun");
     }
 
     #[test]

@@ -99,6 +99,39 @@ bool trace(vec3 o, vec3 d, ivec3 c, float tmax, out Hit h) {
   return false;
 }
 
+// Sunlight from outside: from o (just outside a window) along d, does the ray leave the
+// grid without passing through any free cell, i.e. any other part of the room?
+bool sunClear(vec3 o, vec3 d) {
+  float t0 = 0.0, t1 = INF;
+  for (int a = 0; a < 3; a++) {
+    float lo = cutv(a, 0), hi = cutv(a, uN[a] - 1);
+    if (abs(d[a]) < 1e-9) { if (o[a] < lo || o[a] > hi) return true; }
+    else {
+      float ta = (lo - o[a]) / d[a], tb = (hi - o[a]) / d[a];
+      t0 = max(t0, min(ta, tb));
+      t1 = min(t1, max(ta, tb));
+    }
+  }
+  if (t1 <= t0) return true;
+  o += d * (t0 + 1e-4);
+  ivec3 c = cellAt(o);
+  if (c.x < 0 || c.y < 0 || c.z < 0) return true;
+  vec3 tn = vec3(INF);
+  for (int a = 0; a < 3; a++) {
+    if (d[a] > 1e-9) tn[a] = (cutv(a, c[a] + 1) - o[a]) / d[a];
+    else if (d[a] < -1e-9) tn[a] = (cutv(a, c[a]) - o[a]) / d[a];
+  }
+  for (int it = 0; it < 400; it++) {
+    if (isFree(c)) return false;
+    int m = tn.x < tn.y ? (tn.x < tn.z ? 0 : 2) : (tn.y < tn.z ? 1 : 2);
+    bool fwd = d[m] > 0.0;
+    if ((fwd && c[m] + 1 >= uN[m] - 1) || (!fwd && c[m] == 0)) return true;
+    c[m] += fwd ? 1 : -1;
+    tn[m] = fwd ? (cutv(m, c[m] + 1) - o[m]) / d[m] : (cutv(m, c[m]) - o[m]) / d[m];
+  }
+  return true;
+}
+
 float hitSign(Hit h, vec3 d) { return d[h.axis] > 0.0 ? -1.0 : 1.0; }
 float hitPos(Hit h) { return cutv(h.axis, h.k); }
 
@@ -138,7 +171,8 @@ vec3 direct(vec3 p, vec3 n, ivec3 c) {
       vec3 q = p + ld * t;
       if (t > 0.0 && q[ua] > r.x && q[ua] < r.y && q[va] > r.z && q[va] < r.w) {
         Hit h;
-        if (trace(p, ld, c, t + 0.02, h) && windowAt(h, hitSign(h, ld), p + ld * h.t) == w) e += SUNCOL * (SUN * cb);
+        if (trace(p, ld, c, t + 0.02, h) && windowAt(h, hitSign(h, ld), p + ld * h.t) == w && sunClear(p + ld * (h.t + 2e-3), ld))
+          e += SUNCOL * (SUN * cb);
       }
     }
     // sky through the window (area light, one sample)
@@ -248,7 +282,7 @@ vec3 fog(vec3 o, vec3 d, float thit) {
         float t = ta + (float(k) + j) * dt;
         vec3 x = o + d * t;
         Hit h;
-        if (trace(x, ld, cellAt(x), s0 + s1 * t + 0.02, h) && windowAt(h, hitSign(h, ld), x + ld * h.t) == w)
+        if (trace(x, ld, cellAt(x), s0 + s1 * t + 0.02, h) && windowAt(h, hitSign(h, ld), x + ld * h.t) == w && sunClear(x + ld * (h.t + 2e-3), ld))
           l += SUNCOL * (SHAFT * ph * SHAFT_SIGMA * dt * exp(-SIGMA * t));
       }
     }
