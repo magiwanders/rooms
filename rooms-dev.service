@@ -1,0 +1,11 @@
+[Unit]
+Description=Rooms dev static server for web/ (loopback 127.0.0.1:8642, no caching; reach via SSH tunnel / VS Code Ports)
+
+[Service]
+WorkingDirectory=/home/ssc-home-server/rooms
+ExecStart=/home/ssc-home-server/rooms/serve.sh
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
