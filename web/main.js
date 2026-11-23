@@ -293,8 +293,6 @@ function panelKey(e) {
 // ---- keyboard
 const KEYS = { KeyW: 1, ArrowUp: 1, KeyS: 2, ArrowDown: 2, KeyA: 4, ArrowLeft: 4, KeyD: 8, ArrowRight: 8 };
 let keys = 0;
-let eHeld = false; // E: extrude mode (hover highlights the region, drag moves it with the mouse)
-function setExtrude(on) { if (on !== eHeld) { eHeld = on; X.set_extrude_hint(on ? 1 : 0); } }
 let showHelp = false;
 let preview = false;
 const brackets = new Set();
@@ -320,7 +318,6 @@ addEventListener('keydown', (e) => {
   if (KEYS[e.code]) { keys |= KEYS[e.code]; e.preventDefault(); }
   if (e.key === 'Alt') e.preventDefault(); // keep Firefox/Windows from focusing the menu bar
   if (e.key === 'Shift' && locked) setPreview(true);
-  if (e.code === 'KeyE') setExtrude(true);
   if (e.code === 'BracketLeft' || e.code === 'BracketRight') {
     brackets.add(e.code);
     if (brackets.size === 2) {
@@ -337,17 +334,15 @@ addEventListener('keyup', (e) => {
   if (KEYS[e.code]) keys &= ~KEYS[e.code];
   if (e.key === 'Alt') e.preventDefault();
   if (e.key === 'Shift') setPreview(false);
-  if (e.code === 'KeyE') setExtrude(false);
   brackets.delete(e.code);
 });
-addEventListener('blur', () => { keys = 0; brackets.clear(); setPreview(false); setExtrude(false); });
+addEventListener('blur', () => { keys = 0; brackets.clear(); setPreview(false); });
 
 // ---- mouse: pointer lock (click to capture, Esc releases); actions hit the crosshair
 const C = [0.5, 0.5];
 const SENS = 0.0025;
 let locked = false;
-let mode = null; // 'repeat' | 'extrude' | 'tiles' | 'shift' (click or drag undecided) | 'erase' | 'win'
-let extAcc = 0, extDist = 1; // extrude: metres of mouse travel not applied yet; distance to the surface
+let mode = null; // 'repeat' | 'tiles' | 'shift' (click or drag undecided) | 'erase' | 'win'
 let shiftMoved = 0;
 let pushDir = 1, pushStart = 0, repeatTimeout, repeatInterval;
 
@@ -360,6 +355,7 @@ function pushSteps() {
 function report(r) {
   if (r === 2) msg('you are in the way');
   else if (r === 3) msg("can't go further that way");
+  else if (r === 4) msg('ceilings stay at least 2 m up');
 }
 // the region pressed on is locked (grip) until mouseup, so it moves as one piece
 function doPush() {
@@ -382,7 +378,7 @@ document.addEventListener('pointerlockchange', () => {
   crosshair.style.display = locked ? 'block' : 'none';
   startEl.style.display = locked ? 'none' : 'block';
   X.set_hover(locked ? 0.5 : -1, locked ? 0.5 : -1);
-  if (!locked) { endAction(); keys = 0; setPreview(false); setExtrude(false); if (ui) closePanel(); } // Esc while captured
+  if (!locked) { endAction(); keys = 0; setPreview(false); if (ui) closePanel(); } // Esc while captured
 });
 document.addEventListener('pointerlockerror', () => msg('the browser refused to capture the mouse; click again'));
 
@@ -405,7 +401,6 @@ canvas.addEventListener('mousedown', (e) => {
   const t = X.tile_begin(...C); // on the floor: toggle a mirror tile, dragging paints the same onto more tiles
   if (t) { if (t === 3) msg('mirrors too far apart'); mode = 'tiles'; return; }
   if (!X.grip_begin(...C)) return;
-  if (eHeld) { mode = 'extrude'; extAcc = 0; extDist = Math.max(0.5, X.pick_dist(...C)); return; }
   pushDir = e.button === 2 ? -1 : 1;
   mode = 'repeat';
   pushStart = performance.now();
@@ -418,19 +413,6 @@ document.addEventListener('mousemove', (e) => {
   if (mode === 'shift') {
     shiftMoved += Math.abs(dx) + Math.abs(dy);
     if (shiftMoved > 6) { mode = 'erase'; X.erase(...C); }
-  }
-  if (mode === 'extrude') {
-    // the view holds still; moving the mouse up pushes the region away, down pulls it
-    // closer, faster for far surfaces, in 25 cm steps
-    extAcc += -dy * 0.006 * Math.max(1, extDist / 2.5);
-    const n = Math.trunc(extAcc / 0.25);
-    if (n !== 0) {
-      let moved = n, r = X.grip_step(n);
-      if (r !== 1 && Math.abs(n) > 1) { moved = Math.sign(n); r = X.grip_step(moved); }
-      if (r === 1) { extAcc -= moved * 0.25; extDist = Math.max(0.5, extDist + moved * 0.25); }
-      else { extAcc = 0; report(r); }
-    }
-    return;
   }
   if (mode === 'tiles') {
     // sweep in small steps so fast moves don't skip tiles
@@ -465,7 +447,6 @@ const HELP = [
   ['wasd/arrows', 'walk'],
   ['click', 'push'],
   ['right click', 'pull'],
-  ['e+drag', 'extrude (drag up / down)'],
   ['click floor', 'mirror tile, drag to paint more'],
   ['shift+click', 'vertical and horizontal line'],
   ['shift+drag', 'erase lines'],
@@ -515,7 +496,6 @@ function render() {
   gl.uniform4f(L.uHover, u[32], u[33], u[34], u[35]);
   gl.uniform1i(L.uHoverOff, u[36]);
   gl.uniform1i(L.uHoverN, u[37]);
-  gl.uniform1i(L.uHoverMode, u[38]);
   gl.uniform3f(L.uTileHover, u[39], u[46], u[47]);
   gl.uniform1i(L.uMirOff, u[176]);
   gl.uniform1i(L.uMirI0, u[177]);

@@ -27,10 +27,9 @@ uniform ivec3 uN, uCutOff, uCamCell; // cut counts, their offsets in uData, came
 uniform int uNPlanes, uPlaneOff;     // plane table: (axis, sign, pos, nu, nv, off, -, -)
 uniform vec4 uHover;                 // on, axis, sign, pos
 uniform int uHoverOff, uHoverN;      // rects (u0, u1, v0, v1) in uData
-uniform int uHoverMode;              // 1 = E held: the region is ready to extrude
 uniform int uMirOff, uMirI0, uMirJ0, uMirW, uMirH; // mirror floor tiles: a w x h mask in uData
 uniform vec3 uTileHover;             // on, i, j: the floor tile under the crosshair
-uniform vec4 uPreview;               // on, axis, sign, pos
+uniform vec4 uPreview;               // on (1: both lines, 2: vertical only, below 2 m), axis, sign, pos
 uniform vec2 uPreview2;              // u, v
 uniform vec4 uWin[128];              // per window: (axis, sign, pos, area) (ua, va, outside light, -) (u0, u1, v0, v1) (sun direction, -)
 out vec4 outColor;
@@ -280,8 +279,7 @@ vec3 albedo(Hit h, float s, vec3 p) {
     for (int i = 0; i < uHoverN; i++) {
       int o = uHoverOff + 4 * i;
       if (u >= D(o) && u <= D(o + 1) && v >= D(o + 2) && v <= D(o + 3)) {
-        a = uHoverMode == 1 ? a * vec3(1.1, 1.04, 0.92) + vec3(0.05, 0.04, 0.02)   // extrude: warm
-                            : a * vec3(0.93, 1.0, 1.12) + vec3(0.02, 0.03, 0.05);
+        a = a * vec3(0.93, 1.0, 1.12) + vec3(0.02, 0.03, 0.05);
         break;
       }
     }
@@ -393,7 +391,7 @@ vec3 radiance(vec3 o, vec3 d) {
       if (bounce == 0 && uPreview.x > 0.5 && int(uPreview.y) == h.axis && uPreview.z == s && abs(uPreview.w - hitPos(h)) < 1e-3) {
         ivec2 uv = uvAxes(h.axis);
         float w = 0.003 + 0.002 * h.t;
-        if (abs(p[uv.x] - uPreview2.x) < w || abs(p[uv.y] - uPreview2.y) < w) L = L * 0.4 + vec3(0.30, 0.24, 0.14);
+        if (abs(p[uv.x] - uPreview2.x) < w || (uPreview.x < 1.5 && abs(p[uv.y] - uPreview2.y) < w)) L = L * 0.4 + vec3(0.30, 0.24, 0.14);
       }
     }
     return acc + thr * L;

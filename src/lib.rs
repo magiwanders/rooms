@@ -39,6 +39,9 @@ const WALK_TAU: f32 = 0.5;
 const SUBSTEP: f32 = 0.1; // max movement per collision check (m), so fast walking can't tunnel
 const HFOV_TAN: f32 = 0.767; // tan(75deg / 2)
 const MIN_WIN_Y: f32 = 2.0; // no windows in the first 2 m
+/// Headroom: no horizontal line and no horizontal surface (other than the ground) below
+/// this, so there is always room to walk under everything.
+const CLEAR: f32 = 2.0;
 const MAX_WINS: usize = 32; // per room (the shader samples a few per pixel, so this stays cheap)
 /// Outside light reaching a window: OUTSIDE_MIN for one facing away from the sun, up to 1
 /// for one facing it with nothing outside blocking the sun.
@@ -614,7 +617,7 @@ impl Win {
     }
 }
 
-/// A region locked for a held click or an E-drag: it keeps moving as one piece even if
+/// A region locked for a held click: it keeps moving as one piece even if
 /// it lines up with a neighbouring face on the way (which would otherwise merge them).
 #[derive(Clone)]
 struct Grip {
@@ -689,8 +692,7 @@ struct State {
     preview: bool,
     preview_at: [f32; 6],
     drag_win: Option<usize>,
-    grip: Option<Grip>,  // the region held by a click or an E-drag
-    extrude_hint: bool,  // E held: highlight the region under the crosshair differently
+    grip: Option<Grip>,  // the region held by a click
     ubuf: Vec<f32>,
     data: Vec<f32>,
     undo: Vec<Snap>,
@@ -732,7 +734,6 @@ impl State {
             preview_at: [0.0; 6],
             drag_win: None,
             grip: None,
-            extrude_hint: false,
             ubuf: vec![0.0; U_LEN],
             data: vec![],
             undo: vec![],
@@ -1077,8 +1078,12 @@ impl State {
         }
         let (ua, va) = uva(m);
         let mut q = p - s * STEP * dir;
-        if m == 1 && q < 0.0 && p > EPS {
-            q = 0.0; // a big step down stops at ground level
+        if m == 1 && s < 0.0 && q < CLEAR - EPS {
+            return (4, p); // ceilings stay at least 2 m up
+        }
+        if m == 1 && s > 0.0 && q < CLEAR - EPS {
+            // a raised floor can't sit between the ground and 2 m: down it drops to the ground
+            q = if dir > 0.0 { 0.0 } else { CLEAR };
         }
         if (m == 1 && (q < -EPS || q > MAX_HEIGHT + EPS)) || q.abs() > MAXD {
             return (3, p);
@@ -1351,7 +1356,8 @@ impl State {
         match self.pick(0.5, 0.5) {
             Some(h) if !h.is_ground() => {
                 let (u, w) = h.uv();
-                [1.0, h.axis as f32, h.s, h.pos, u, w]
+                let flat_ok = h.axis == 1 || w >= CLEAR - 1e-3; // horizontal line allowed here?
+                [if flat_ok { 1.0 } else { 2.0 }, h.axis as f32, h.s, h.pos, u, w.max(if h.axis == 1 { w } else { CLEAR })]
             }
             _ => [0.0; 6],
         }
@@ -1470,7 +1476,6 @@ impl State {
         }
         u[31] = (self.occ_version % (1 << 20)) as f32;
         u[40..46].copy_from_slice(&self.preview_at);
-        u[38] = self.extrude_hint as u8 as f32;
         for (i, w) in self.wins.iter().enumerate() {
             let (ua, va) = uva(w.axis);
             let b = w.beam();
@@ -1616,7 +1621,8 @@ pub extern "C" fn set_preview(on: i32) {
 }
 
 /// dir > 0 push away, < 0 pull closer, by |dir| steps of 25 cm (held clicks grow it).
-/// 0 = nothing pushable, 1 = ok, 2 = blocked by the player, 3 = at a limit.
+/// 0 = nothing pushable, 1 = ok, 2 = blocked by the player, 3 = at a limit,
+/// 4 = a ceiling would come below 2 m.
 #[no_mangle]
 pub extern "C" fn push(sx: f32, sy: f32, dir: f32) -> i32 {
     let s = st();
@@ -1666,7 +1672,7 @@ pub extern "C" fn tile_end() {
     st().tile_last = None;
 }
 
-/// Press on a surface: lock its region for grip_step (held clicks, E-drag).
+/// Press on a surface: lock its region for grip_step (held clicks).
 /// Returns 1 if there is something to move there, 0 otherwise (e.g. the ground).
 #[no_mangle]
 pub extern "C" fn grip_begin(sx: f32, sy: f32) -> i32 {
@@ -1724,22 +1730,6 @@ pub extern "C" fn grip_end() {
     st().grip = None;
 }
 
-/// Distance to the surface under the screen point (m), or -1.
-#[no_mangle]
-pub extern "C" fn pick_dist(sx: f32, sy: f32) -> f32 {
-    st().pick(sx, sy).map_or(-1.0, |h| h.t)
-}
-
-/// E held: highlight the region under the crosshair as extrudable.
-#[no_mangle]
-pub extern "C" fn set_extrude_hint(on: i32) {
-    let s = st();
-    if s.extrude_hint != (on != 0) {
-        s.extrude_hint = on != 0;
-        s.dirty = true;
-    }
-}
-
 /// Ctrl+click: vertical = 1 adds a vertical line (screen-vertical on floors/ceilings).
 #[no_mangle]
 pub extern "C" fn add_line(sx: f32, sy: f32, vertical: i32) -> i32 {
@@ -1756,7 +1746,13 @@ pub extern "C" fn add_line(sx: f32, sy: f32, vertical: i32) -> i32 {
         cut_u = if vertical != 0 { !along_x } else { along_x };
     }
     let (ua, va) = uva(h.axis);
-    let (u, w) = h.uv();
+    let (u, mut w) = h.uv();
+    if !cut_u && h.axis != 1 {
+        if w < CLEAR - 1e-3 {
+            return 0; // no horizontal lines below 2 m
+        }
+        w = w.max(CLEAR);
+    }
     let (axis, at) = if cut_u { (ua, u) } else { (va, w) };
     let before = s.snap();
     let Some(k) = s.grid.insert_cut(axis, at) else { return 0 };
@@ -1787,17 +1783,26 @@ pub extern "C" fn add_cross(sx: f32, sy: f32) -> i32 {
         return 0;
     }
     let (ua, va) = uva(h.axis);
-    let (u, w) = h.uv();
+    let (u, mut w) = h.uv();
+    // on a wall, the horizontal line only above 2 m (just within 1 mm snaps to 2 m)
+    let flat = h.axis == 1 || w >= CLEAR - 1e-3;
+    if flat && h.axis != 1 {
+        w = w.max(CLEAR);
+    }
     let before = s.snap();
-    let (Some(ku), Some(kv)) = (s.grid.insert_cut(ua, u), s.grid.insert_cut(va, w)) else {
+    let ku = s.grid.insert_cut(ua, u);
+    let kv = if flat { s.grid.insert_cut(va, w) } else { Some(0) };
+    let (Some(ku), Some(kv)) = (ku, kv) else {
         s.restore_quiet(before);
         return 0;
     };
     let (xu, xv) = (s.grid.c[ua][ku], s.grid.c[va][kv]);
     let l = s.lines.entry(h.key()).or_default();
-    let had = l.blocks_u(xu, w) && l.blocks_v(xv, u);
+    let had = l.blocks_u(xu, w) && (!flat || l.blocks_v(xv, u));
     l.insert_u(xu, true);
-    l.insert_v(xv, true);
+    if flat {
+        l.insert_v(xv, true);
+    }
     if had {
         s.restore_quiet(before);
         return 0;
@@ -2167,16 +2172,14 @@ mod tests {
         aim(v(1.5, 2.5, 0.0));
         assert_eq!(win_begin(0.5, 0.5), 1);
         win_end();
-        // pull the ceiling down to 2 m, then the player is in the way
+        // pull the ceiling down to 2 m, and no further
         for _ in 0..4 {
             aim(v(0.5, st().grid.c[1].last().copied().unwrap(), 0.5));
             assert_eq!(push(0.5, 0.5, -1.0), 1);
         }
         assert!(free(v(0.0, 1.95, 0.0)) && !free(v(0.0, 2.05, 0.0)));
         aim(v(0.5, 2.0, 0.5));
-        assert_eq!(push(0.5, 0.5, -1.0), 1, "1.75 m still clears a 1.75 m player");
-        aim(v(0.5, 1.75, 0.5));
-        assert_eq!(push(0.5, 0.5, -1.0), 2, "the player is in the way");
+        assert_eq!(push(0.5, 0.5, -1.0), 4, "ceilings stay at least 2 m up");
     }
 
     #[test]
@@ -2332,17 +2335,40 @@ mod tests {
     }
 
     #[test]
-    fn big_steps_down_stop_at_ground_level() {
+    fn raised_floors_drop_to_the_ground_below_two_metres() {
         setup(0.0, 0.0);
-        // make a raised sill: pull a lower strip of the east wall in, then push its top down hard
-        aim(v(1.5, 0.5, 0.0));
+        // a block standing out of the east wall up to 2.5 m: its top faces up at 2.5 m
+        aim(v(1.5, 2.5, 0.0));
         assert_eq!(add_line(0.5, 0.5, 0), 1);
-        aim(v(1.5, 0.25, 0.0));
-        assert_eq!(push(0.5, 0.5, -1.0), 1); // a 25 cm deep, ~0.5 m high ledge
-        aim(v(1.4, *st().grid.c[1].get(1).unwrap(), 0.0));
-        let r = push(0.5, 0.5, 20.0);
-        assert_eq!(r, 1);
-        assert!(st().grid.free_at(v(1.4, 0.1, 0.0)), "ledge carved down to the ground, not below");
+        aim(v(1.5, 1.0, 0.0));
+        assert_eq!(push(0.5, 0.5, -2.0), 1);
+        assert!(!free(v(1.1, 1.0, 0.0)) && free(v(1.1, 2.6, 0.0)));
+        // push its top down to 2.25 m and 2 m: fine, still at least 2 m up
+        aim(v(1.2, 2.5, 0.0));
+        assert_eq!(push(0.5, 0.5, 1.0), 1);
+        assert!(free(v(1.1, 2.3, 0.0)));
+        aim(v(1.2, 2.25, 0.0));
+        assert_eq!(push(0.5, 0.5, 1.0), 1);
+        // the next step would leave it at 1.75 m: it drops to the ground instead
+        aim(v(1.2, 2.0, 0.0));
+        assert_eq!(push(0.5, 0.5, 1.0), 1);
+        assert!(free(v(1.1, 0.1, 0.0)), "the block is gone: nothing between the ground and 2 m");
+    }
+
+    #[test]
+    fn no_horizontal_lines_below_two_metres() {
+        setup(0.0, 0.0);
+        aim(v(1.5, 1.2, 0.0));
+        assert_eq!(add_line(0.5, 0.5, 0), 0, "horizontal line at 1.2 m refused");
+        // shift+click low down adds only the vertical line
+        assert_eq!(add_cross(0.5, 0.5), 1);
+        let l = st().lines.values().next().unwrap();
+        assert_eq!((l.us.len(), l.vs.len()), (1, 0));
+        // the shift preview shows only the vertical line there
+        st().preview = true;
+        assert_eq!(st().make_preview()[0], 2.0);
+        aim(v(1.5, 2.4, 0.5));
+        assert_eq!(st().make_preview()[0], 1.0);
     }
 
     #[test]
@@ -2377,12 +2403,12 @@ mod tests {
     #[test]
     fn shift_click_cross_splits_into_four() {
         setup(0.0, 0.0);
-        aim(v(1.5, 1.6, 0.0));
+        aim(v(1.5, 2.2, 0.0));
         assert_eq!(add_cross(0.5, 0.5), 1);
         aim(v(1.5, 0.8, 0.7));
         assert_eq!(push(0.5, 0.5, 1.0), 1);
         assert!(free(v(1.6, 0.8, 0.7)));
-        assert!(!free(v(1.6, 2.4, 0.7)) && !free(v(1.6, 0.8, -0.7)) && !free(v(1.6, 2.4, -0.7)));
+        assert!(!free(v(1.6, 2.6, 0.7)) && !free(v(1.6, 0.8, -0.7)) && !free(v(1.6, 2.6, -0.7)));
         assert_eq!(undo(), 1);
         assert_eq!(undo(), 1, "cross was one step");
         assert!(st().lines.is_empty());
