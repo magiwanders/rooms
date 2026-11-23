@@ -407,6 +407,7 @@ canvas.addEventListener('mousedown', (e) => {
     const r = X.win_begin(...C);
     if (r === 3) msg('no windows in the first 2 m above the floor');
     else if (r === 4) msg('enough windows');
+    else if (r === 5) msg('too many windows in this room');
     else if (r === 0) msg('windows go on walls or the ceiling');
     else mode = 'win';
     return;
@@ -493,7 +494,7 @@ let last = performance.now(), fpsT = last, frames = 0, fpsShown = 0, slow = 0, f
 
 function render() {
   const w = canvas.width, h = canvas.height;
-  const u = new Float32Array(X.memory.buffer, X.frame(w, h), 192).slice();
+  const u = new Float32Array(X.memory.buffer, X.frame(w, h), 192 + 16 * 32).slice();
   uploadData(X.data_ptr(), X.data_len());
   uploadOcc(u[31]);
   const src = acc[frameNo & 1], dst = acc[(frameNo + 1) & 1];
@@ -537,7 +538,7 @@ function render() {
   gl.uniform1i(L.uMirH, u[180]);
   gl.uniform4f(L.uPreview, u[40], u[41], u[42], u[43]);
   gl.uniform2f(L.uPreview2, u[44], u[45]);
-  gl.uniform4fv(L.uWin, u.subarray(48, 176));
+  gl.uniform4fv(L.uWin, u.subarray(192, 192 + 16 * 32));
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   gl.useProgram(showP.p);

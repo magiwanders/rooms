@@ -32,13 +32,13 @@ uniform int uMirOff, uMirI0, uMirJ0, uMirW, uMirH; // mirror floor tiles: a w x 
 uniform vec3 uTileHover;             // on, i, j: the floor tile under the crosshair
 uniform vec4 uPreview;               // on, axis, sign, pos
 uniform vec2 uPreview2;              // u, v
-uniform vec4 uWin[32];               // per window: (axis, sign, pos, area) (ua, va, -, -) (u0, u1, v0, v1) (sun direction, -)
+uniform vec4 uWin[128];              // per window: (axis, sign, pos, area) (ua, va, outside light, -) (u0, u1, v0, v1) (sun direction, -)
 out vec4 outColor;
 
 const float PI = 3.14159265;
 const float INF = 1e30;
 // keep SUN / SKY in sync with src/lib.rs
-const float SUN = 4.0, SKY = 8.0, SKY_VIEW = 6.0;
+const float SUN = 4.0, SKY = 8.0, SKY_VIEW = 1.6; // SKY_VIEW: a window seen directly, times its outside light
 uniform float uSigma;          // mist density (1/m), set from the page
 #define SIGMA uSigma
 const float SUN_SPREAD = 0.06; // apparent sun size: soft edges on sunlit patches
@@ -50,6 +50,7 @@ const float FOG_BASE = 0.035;  // faint glow of the mist itself: far space fades
 const vec3 SUNCOL = vec3(1.0, 0.88, 0.70);
 const vec3 SKYCOL = vec3(0.75, 0.86, 1.0);
 const int VPL_PER_PIXEL = 3;
+const int WIN_SAMPLES = 3; // windows lighting a pixel per frame (random ones if there are more)
 const float TILE = 0.6;                      // floor tile size (src/lib.rs TILE)
 const vec3 MIRROR = vec3(0.85, 0.87, 0.9);   // mirror tile reflectance (src/lib.rs MIRROR_R)
 const float MIRROR_R = 0.85;
@@ -171,8 +172,13 @@ vec3 winPoint(int w, float fu, float fv) {
 // light arriving at p (normal n, free cell c) straight from the windows
 vec3 direct(vec3 p, vec3 n, ivec3 c) {
   vec3 e = vec3(0.0);
-  for (int w = 0; w < uNWin; w++) {
+  int nW = min(uNWin, WIN_SAMPLES);
+  float wW = float(uNWin) / float(max(nW, 1));
+  for (int k = 0; k < nW; k++) {
+    int w = uNWin <= WIN_SAMPLES ? k : min(int(rnd() * float(uNWin)), uNWin - 1);
+    vec3 e0 = e;
     vec4 a = uWin[4 * w], b = uWin[4 * w + 1], r = uWin[4 * w + 2];
+    float outside = b.z;
     vec3 ld = normalize(-uWin[4 * w + 3].xyz + SUN_SPREAD * (vec3(rnd(), rnd(), rnd()) - 0.5));  // toward the sun
     int ax = int(a.x), ua = int(b.x), va = int(b.y);
     float ws = a.y, wpos = a.z, area = a.w;
@@ -214,8 +220,9 @@ vec3 direct(vec3 p, vec3 n, ivec3 c) {
     float cp = dot(n, l), cw = -ws * l[ax];
     if (cp > 0.0 && cw > 0.0) {
       Hit h;
-      if (!trace(p, l, c, dist - 0.01, h)) e += SKYCOL * (SKY * area * cp * cw / r2);
+      if (!trace(p, l, c, dist - 0.01, h)) e += SKYCOL * (SKY * outside * area * cp * cw / r2);
     }
+    e = e0 + (e - e0) * wW;
   }
   return e;
 }
@@ -297,7 +304,11 @@ void clip(inout float ta, inout float tb, float a, float b, float lo, float hi) 
 // mist: base haze, sun shafts (marched only inside each beam's light prism), sky glow
 vec3 fog(vec3 o, vec3 d, float thit) {
   vec3 l = vec3(0.8, 0.82, 0.85) * ((FOG_BASE + AMB_FOG * uArea) * (1.0 - exp(-SIGMA * thit)));
-  for (int w = 0; w < uNWin; w++) {
+  int nW = min(uNWin, WIN_SAMPLES);
+  float wW = float(uNWin) / float(max(nW, 1));
+  for (int kw = 0; kw < nW; kw++) {
+    int w = uNWin <= WIN_SAMPLES ? kw : min(int(rnd() * float(uNWin)), uNWin - 1);
+    vec3 l0 = l;
     vec4 a = uWin[4 * w], b = uWin[4 * w + 1], r = uWin[4 * w + 2];
     vec3 beam = uWin[4 * w + 3].xyz, ld = -beam;
     int ax = int(a.x), ua = int(b.x), va = int(b.y);
@@ -361,7 +372,8 @@ vec3 fog(vec3 o, vec3 d, float thit) {
     float cw = -ws * ldir[ax];
     Hit h;
     if (cw > 0.0 && !trace(x, ldir, cellAt(x), dist - 0.01, h))
-      l += SKYCOL * (SKY * area * cw / r2 / (4.0 * PI) * SIGMA * tl * exp(-SIGMA * t));
+      l += SKYCOL * (SKY * b.z * area * cw / r2 / (4.0 * PI) * SIGMA * tl * exp(-SIGMA * t));
+    l = l0 + (l - l0) * wW;
   }
   return l;
 }
@@ -385,8 +397,9 @@ vec3 radiance(vec3 o, vec3 d) {
       continue;
     }
     vec3 L;
-    if (windowAt(h, s, p) >= 0) {
-      L = SKYCOL * SKY_VIEW;
+    int wi = windowAt(h, s, p);
+    if (wi >= 0) {
+      L = SKYCOL * (SKY_VIEW * uWin[4 * wi + 1].z);  // as bright as the light reaching it from outside
     } else {
       vec3 n = unitv(h.axis, s);
       vec3 pp = p + n * 1e-3;

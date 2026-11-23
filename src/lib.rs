@@ -39,7 +39,10 @@ const WALK_TAU: f32 = 0.5;
 const SUBSTEP: f32 = 0.1; // max movement per collision check (m), so fast walking can't tunnel
 const HFOV_TAN: f32 = 0.767; // tan(75deg / 2)
 const MIN_WIN_Y: f32 = 2.0; // no windows in the first 2 m
-const MAX_WINS: usize = 8;
+const MAX_WINS: usize = 32; // per room (the shader samples a few per pixel, so this stays cheap)
+/// Outside light reaching a window: OUTSIDE_MIN for one facing away from the sun, up to 1
+/// for one facing it with nothing outside blocking the sun.
+const OUTSIDE_MIN: f32 = 0.3;
 const MAX_CUTS: usize = 160; // per axis
 const MAX_UNDO: usize = 300;
 const MAX_HOVER_RECTS: usize = 256;
@@ -60,7 +63,7 @@ fn sun_dir() -> V {
 const SKYCOL: V = v(0.75, 0.86, 1.0);
 const INF: f32 = 1e30;
 /// Uniform block layout (floats), mirrored in web/main.js.
-const U_LEN: usize = 192;
+const U_LEN: usize = 192 + 16 * MAX_WINS; // windows from 192 on, 16 floats each
 /// Floor tiles are TILE x TILE metres (the grout lines in the shader match). Any tile
 /// can be toggled into a mirror; the mirror mask is sent as a box of at most
 /// MIRROR_SPAN x MIRROR_SPAN tiles.
@@ -1181,8 +1184,38 @@ impl State {
         self.lines.retain(|_, l| !l.is_empty());
     }
 
+    /// Drop windows whose wall is gone (a push moved the face away from under them),
+    /// so they don't linger invisibly, blocking their surface and counting toward the limit.
+    fn prune_windows(&mut self) {
+        let g = &self.grid;
+        self.wins.retain(|w| {
+            let (ua, va) = uva(w.axis);
+            match (g.find_cut(w.axis, w.pos), g.cell_of(ua, w.uc), g.cell_of(va, w.vc)) {
+                (Some(k), Some(iu), Some(iv)) => g.is_face(w.axis, w.s, k, iu, iv),
+                _ => false,
+            }
+        });
+    }
+
+    /// How much light reaches a window from outside: more the more it faces the sun,
+    /// less where another part of the room blocks the sun from it (OUTSIDE_MIN..1).
+    fn outside_light(&self, w: &Win) -> f32 {
+        let to_sun = -sun_dir();
+        let facing = unit(w.axis, -w.s).dot(to_sun).max(0.0);
+        if facing <= 0.0 {
+            return OUTSIDE_MIN;
+        }
+        let out = unit(w.axis, -w.s) * 2e-3;
+        let clear = (0..16)
+            .filter(|k| self.grid.sun_clear(w.point((k % 4) as f32 / 4.0 + 0.125, (k / 4) as f32 / 4.0 + 0.125) + out, to_sun))
+            .count() as f32
+            / 16.0;
+        OUTSIDE_MIN + (1.0 - OUTSIDE_MIN) * facing * clear
+    }
+
     /// Drop grid cuts and lines that no longer matter.
     fn cleanup(&mut self) {
+        self.prune_windows();
         self.prune_lines();
         // cuts that carry a line must stay
         let mut keep: [Vec<f32>; 3] = [vec![], vec![], vec![]];
@@ -1247,7 +1280,7 @@ impl State {
                 let q = w.point(rnd(&mut r), rnd(&mut r)) + nin * 2e-3;
                 if let Some(h) = self.trace(q, cos_sample(nin, &mut r), INF) {
                     if self.window_at(&h).is_none() {
-                        let pw = SKY * w.area() * PI / VPL_SKY as f32 * BOUNCE;
+                        let pw = SKY * self.outside_light(w) * w.area() * PI / VPL_SKY as f32 * BOUNCE;
                         out.push(Vpl { p: h.p + h.n * 2e-3, n: h.n, power: SKYCOL.mulv(albedo(&h)) * pw });
                     }
                 }
@@ -1414,7 +1447,7 @@ impl State {
         for (i, w) in self.wins.iter().enumerate() {
             let (ua, va) = uva(w.axis);
             let b = w.beam();
-            let o = 48 + i * 16;
+            let o = 192 + i * 16;
             u[o..o + 16].copy_from_slice(&[
                 w.axis as f32,
                 w.s,
@@ -1422,7 +1455,7 @@ impl State {
                 w.area(),
                 ua as f32,
                 va as f32,
-                0.0,
+                self.outside_light(w),
                 0.0,
                 w.uc - w.hu,
                 w.uc + w.hu,
@@ -1765,7 +1798,7 @@ pub extern "C" fn erase(sx: f32, sy: f32) -> i32 {
 
 /// Alt+press: start a window (or grab an existing one to resize).
 /// 0 = not on a wall/ceiling, 1 = created, 2 = grabbed existing, 3 = too low,
-/// 4 = enough windows (this surface already has one, or the room has MAX_WINS).
+/// 4 = enough windows (this surface already has one), 5 = the room has MAX_WINS.
 #[no_mangle]
 pub extern "C" fn win_begin(sx: f32, sy: f32) -> i32 {
     let s = st();
@@ -1778,7 +1811,7 @@ pub extern "C" fn win_begin(sx: f32, sy: f32) -> i32 {
         return 0; // floors and sills face up: no windows there
     }
     if s.wins.len() >= MAX_WINS {
-        return 4;
+        return 5;
     }
     // one window per surface (the region under the crosshair)
     let (ua, va) = uva(h.axis);
@@ -2457,6 +2490,58 @@ mod tests {
             }
         }
         assert_eq!(count_floor(st()), 0, "the beam now bounces up off the mirrors");
+    }
+
+    #[test]
+    fn windows_whose_wall_moves_away_are_removed() {
+        setup(0.0, 0.0);
+        // a window on the east wall, then split the wall right through the window's
+        // left edge and push the half without the window's centre: the window stays
+        aim(v(1.5, 2.5, 0.0));
+        assert_eq!(win_begin(0.5, 0.5), 1);
+        win_end();
+        assert_eq!(st().wins.len(), 2);
+        // push the whole east wall (one region): the window travels with it
+        aim(v(1.5, 1.0, -1.0));
+        assert_eq!(push(0.5, 0.5, 1.0), 1);
+        assert_eq!(st().wins.len(), 2);
+        assert_eq!(st().wins[1].pos, 1.75);
+        // a window left on a vanished face is removed
+        st().wins.push(Win { axis: 0, s: -1.0, pos: 1.5, uc: 0.5, vc: 2.5, hu: 0.1, hv: 0.1 });
+        st().cleanup();
+        assert_eq!(st().wins.len(), 2, "orphan window dropped");
+        // and its surface takes a window again: many surfaces, one window each, beyond the old limit of 8
+        let mut placed = 0;
+        for k in 0..12 {
+            let z = -1.4 + 0.25 * k as f32;
+            aim(v(1.75, 1.6, z));
+            if add_line(0.5, 0.5, 1) == 1 {
+                placed += 1;
+            }
+        }
+        assert!(placed >= 10);
+        let mut wins = 0;
+        for k in 0..12 {
+            let z = -1.4 + 0.25 * k as f32 + 0.12;
+            aim(v(1.75, 2.6, z));
+            if win_begin(0.5, 0.5) == 1 {
+                wins += 1;
+            }
+            win_end();
+        }
+        assert!(st().wins.len() > 8, "{} windows", st().wins.len());
+        let _ = wins;
+    }
+
+    #[test]
+    fn windows_facing_away_from_the_sun_get_less_light() {
+        setup(0.0, 0.0);
+        aim(v(0.0, 2.5, 1.5)); // south wall: faces away from the sun
+        assert_eq!(win_begin(0.5, 0.5), 1);
+        win_end();
+        let s = st();
+        let (north, south) = (s.outside_light(&s.wins[0]), s.outside_light(&s.wins[1]));
+        assert!(north > 0.7 && (south - OUTSIDE_MIN).abs() < 1e-6, "north {north}, south {south}");
     }
 
     #[test]
