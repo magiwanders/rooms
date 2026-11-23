@@ -320,29 +320,37 @@ vec3 fog(vec3 o, vec3 d, float thit) {
           l += SUNCOL * (SHAFT * ph * SHAFT_SIGMA * dt * exp(-SIGMA * t));
       }
     }
-    // shafts of sunlight reflected up off mirror tiles (sampled at random points)
+    // shafts of sunlight reflected up off mirror tiles. Unfolded through the floor, the
+    // reflected beam comes straight from the window's mirror image below the ground, so
+    // its prism can be clipped exactly like the direct beam's, at any distance.
     if (uMirW > 0 && ld[ax] * ws < -1e-4) {
-      vec3 bm = vec3(beam.x, -beam.y, beam.z), lr = -bm;  // reflected beam travels up; lr goes down to the mirror
-      float g = 0.55, cs = dot(bm, -d);
-      float ph = (1.0 - g * g) / (4.0 * PI * pow(1.0 + g * g - 2.0 * g * cs, 1.5));
-      float tl = min(thit, 30.0);
-      for (int k = 0; k < 2; k++) {
-        float t = (float(k) + rnd()) * 0.5 * tl;
-        vec3 x = o + d * t;
-        if (x.y <= 1e-3) continue;
-        float tm = -x.y / lr.y;
-        vec3 m = x + lr * tm;
-        if (!isMirror(m)) continue;
-        Hit h;
-        ivec3 cx = cellAt(x);
-        if (!trace(x, lr, cx, tm + 0.02, h) || h.axis != 1 || abs(h.t - tm) > 0.01) continue;
-        vec3 mp = m + vec3(0.0, 1e-3, 0.0);
-        float t2 = (wpos - mp[ax]) / ld[ax];
-        vec3 q = mp + ld * t2;
-        if (t2 <= 0.0 || q[ua] <= r.x || q[ua] >= r.y || q[va] <= r.z || q[va] >= r.w) continue;
-        Hit h2;
-        if (trace(mp, ld, h.cell, t2 + 0.02, h2) && windowAt(h2, hitSign(h2, ld), mp + ld * h2.t) == w && sunClear(mp + ld * (h2.t + 2e-3), ld))
-          l += SUNCOL * (SHAFT * MIRROR_R * ph * SHAFT_SIGMA * 0.5 * tl * exp(-SIGMA * t));
+      vec3 bm = vec3(beam.x, -beam.y, beam.z), lr = -bm;  // reflected beam goes up; lr goes back down to the mirror
+      float ipos = ax == 1 ? -wpos : wpos;                 // image window plane
+      vec4 ir = va == 1 ? vec4(r.x, r.y, -r.w, -r.z) : r;  // wall windows: heights flip under the floor
+      float s0 = (ipos - o[ax]) / lr[ax], s1 = -d[ax] / lr[ax];
+      float ta = 0.0, tb = thit;
+      clip(ta, tb, s0, s1, 0.0, INF);
+      clip(ta, tb, o[ua] + lr[ua] * s0, d[ua] + lr[ua] * s1, ir.x, ir.y);
+      clip(ta, tb, o[va] + lr[va] * s0, d[va] + lr[va] * s1, ir.z, ir.w);
+      if (tb > ta) {
+        float g = 0.55, cs = dot(bm, -d);
+        float ph = (1.0 - g * g) / (4.0 * PI * pow(1.0 + g * g - 2.0 * g * cs, 1.5));
+        float dt = (tb - ta) / float(FOG_STEPS), j = rnd();
+        for (int k = 0; k < FOG_STEPS; k++) {
+          float t = ta + (float(k) + j) * dt;
+          vec3 x = o + d * t;
+          if (x.y <= 1e-3) continue;
+          float tm = -x.y / lr.y;
+          vec3 m = x + lr * tm;
+          if (!isMirror(m)) continue;
+          Hit h;
+          if (!trace(x, lr, cellAt(x), tm + 0.02, h) || h.axis != 1 || abs(h.t - tm) > 0.01) continue;
+          vec3 mp = m + vec3(0.0, 1e-3, 0.0);
+          Hit h2;
+          float t2 = (wpos - mp[ax]) / ld[ax];
+          if (trace(mp, ld, h.cell, t2 + 0.02, h2) && windowAt(h2, hitSign(h2, ld), mp + ld * h2.t) == w && sunClear(mp + ld * (h2.t + 2e-3), ld))
+            l += SUNCOL * (SHAFT * MIRROR_R * ph * SHAFT_SIGMA * dt * exp(-SIGMA * t));
+        }
       }
     }
     float tl = min(thit, 25.0), t = rnd() * tl;
