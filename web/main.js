@@ -293,7 +293,9 @@ function panelKey(e) {
 // ---- keyboard
 const KEYS = { KeyW: 1, ArrowUp: 1, KeyS: 2, ArrowDown: 2, KeyA: 4, ArrowLeft: 4, KeyD: 8, ArrowRight: 8 };
 const MIST = [0, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.01]; // density (1/m)
-let mistIdx = 5;
+// the mist level is remembered across reloads (it used to reset to the middle every time)
+let mistIdx = Number(localStorage.getItem('rooms.mist') ?? 2);
+if (!(mistIdx >= 0 && mistIdx < MIST.length)) mistIdx = 2;
 let keys = 0;
 let eHeld = false; // E: extrude mode (hover highlights the region, drag moves it with the mouse)
 function setExtrude(on) { if (on !== eHeld) { eHeld = on; X.set_extrude_hint(on ? 1 : 0); } }
@@ -337,6 +339,7 @@ addEventListener('keydown', (e) => {
   const more = e.code === 'Equal' || e.code === 'NumpadAdd', less = e.code === 'Minus' || e.code === 'NumpadSubtract';
   if ((more && mistIdx < MIST.length - 1) || (less && mistIdx > 0)) {
     mistIdx += more ? 1 : -1;
+    try { localStorage.setItem('rooms.mist', String(mistIdx)); } catch { /* storage full */ }
     X.invalidate();
     msg(mistIdx === 0 ? 'no mist' : `mist ${mistIdx}/${MIST.length - 1}`);
   }
