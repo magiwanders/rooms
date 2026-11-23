@@ -6,23 +6,60 @@ const hud = document.getElementById('hud');
 const msgEl = document.getElementById('msg');
 const crosshair = document.getElementById('crosshair');
 const startEl = document.getElementById('start');
+const errEl = document.getElementById('err');
 
+// Phones and tablets get touch controls (no mouse capture); ?touch=1 / ?touch=0 forces either.
+const params = new URLSearchParams(location.search);
+const touchParam = params.get('touch');
+const touchMode = touchParam !== null ? touchParam === '1'
+  : navigator.userAgentData?.mobile
+    || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+    || (matchMedia('(pointer: coarse)').matches && !matchMedia('(any-pointer: fine)').matches);
+if (touchMode) document.body.classList.add('touch');
+
+// ---- errors: say what went wrong on the page instead of leaving a black canvas
+let started = false; // the frame loop is running
+let dead = false;    // a fatal error was shown
+function showError(text) {
+  errEl.textContent = text;
+  errEl.style.display = 'block';
+  startEl.style.display = 'none';
+}
+function hideError() {
+  errEl.style.display = 'none';
+  updateStart();
+}
 function fatal(text) {
-  startEl.textContent = text;
-  startEl.style.display = 'block';
+  dead = true;
+  showError(text);
   throw new Error(text);
 }
+// anything thrown before the frame loop runs stops the page: show it (fatal() already did)
+addEventListener('error', (e) => { if (!started && !dead) showError(`rooms could not start: ${e.message || e.error}`); });
+addEventListener('unhandledrejection', (e) => {
+  if (!started && !dead) showError(`rooms could not start: ${e.reason?.message || e.reason}`);
+});
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => { /* still works, just not installable */ });
 
 // ---- engine
-const wasm = await WebAssembly.instantiate(await (await fetch('rooms.wasm')).arrayBuffer(), {});
-const X = wasm.instance.exports;
-X.init();
+let X;
+try {
+  const res = await fetch('rooms.wasm');
+  // an error page (HTML) would only give a confusing compile error below
+  if (!res.ok) throw new Error(`the server answered ${res.status} ${res.statusText}`.trim());
+  const wasm = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+  X = wasm.instance.exports;
+  X.init();
+} catch (err) {
+  fatal(`could not load the engine (rooms.wasm): ${err.message || err}\nreload the page to try again`);
+}
 globalThis.__X = X; // debugging hook (console / tests)
 
 // ---- WebGL2
 const gl = canvas.getContext('webgl2', { antialias: false, depth: false, stencil: false, alpha: false, powerPreference: 'high-performance' });
-if (!gl) fatal('WebGL2 is not available in this browser');
-if (!gl.getExtension('EXT_color_buffer_float')) fatal('this GPU/browser cannot render to float textures (EXT_color_buffer_float)');
+if (!gl) fatal('WebGL2 is not available in this browser.\nTurn on hardware acceleration in the browser settings (chrome://gpu shows its state).');
+globalThis.__gl = gl;
 
 function program(vs, fs) {
   const p = gl.createProgram();
@@ -30,11 +67,11 @@ function program(vs, fs) {
     const s = gl.createShader(type);
     gl.shaderSource(s, src);
     gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) fatal('shader error: ' + gl.getShaderInfoLog(s));
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error('shader error: ' + gl.getShaderInfoLog(s));
     gl.attachShader(p, s);
   }
   gl.linkProgram(p);
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) fatal('link error: ' + gl.getProgramInfoLog(p));
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('link error: ' + gl.getProgramInfoLog(p));
   const loc = {};
   const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
   for (let i = 0; i < n; i++) {
@@ -43,9 +80,6 @@ function program(vs, fs) {
   }
   return { p, loc };
 }
-const traceP = program(VERT, TRACE);
-const showP = program(VERT, SHOW);
-gl.bindVertexArray(gl.createVertexArray());
 
 function floatTex(w, h, internal, format) {
   const t = gl.createTexture();
@@ -58,9 +92,28 @@ function floatTex(w, h, internal, format) {
   return t;
 }
 
+// Every GL object lives here; setupGL() builds them all again after a lost context comes back.
+let traceP, showP, occTex, occVersion = -1;
 // scene data texture (R32F, 1024 wide; grows as needed)
 const DATA_W = 1024;
 let dataTex = null, dataRows = 0, dataBuf = new Float32Array(0);
+// accumulation ping-pong targets
+let acc = [];
+let sinceSetup = 0; // frames drawn since setupGL (the first one may include driver warm-up)
+function setupGL() {
+  if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('this GPU/browser cannot render to float textures (EXT_color_buffer_float)');
+  traceP = program(VERT, TRACE);
+  showP = program(VERT, SHOW);
+  gl.bindVertexArray(gl.createVertexArray());
+  occTex = gl.createTexture();
+  occVersion = -1;
+  dataTex = null;
+  dataRows = 0;
+  acc = [];
+  sinceSetup = 0;
+}
+try { setupGL(); } catch (err) { fatal(err.message); }
+
 function uploadData(ptr, len) {
   const rows = Math.max(1, Math.ceil(len / DATA_W));
   if (rows > dataRows) {
@@ -75,7 +128,6 @@ function uploadData(ptr, len) {
 }
 
 // occupancy: 3D R8 texture of the grid cells (1 = free); re-uploaded when the engine says it changed
-let occTex = gl.createTexture(), occVersion = -1;
 function uploadOcc(version) {
   if (version === occVersion) return;
   occVersion = version;
@@ -90,8 +142,6 @@ function uploadOcc(version) {
   gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, nx, ny, nz, 0, gl.RED, gl.UNSIGNED_BYTE, bytes);
 }
 
-// accumulation ping-pong targets
-let acc = [];
 function makeTargets(w, h) {
   for (const a of acc) { gl.deleteTexture(a.tex); gl.deleteFramebuffer(a.fb); }
   acc = [0, 1].map(() => {
@@ -105,31 +155,71 @@ function makeTargets(w, h) {
 }
 
 // ---- resolution: render height steps; width follows the window's shape
+// Start low and let auto-res climb: a slow GPU at 720p can take seconds for one raytrace draw,
+// and a draw over ~2 s trips the driver watchdog, which kills the WebGL context.
 const RES = [180, 270, 360, 540, 720, 900, 1080];
-const DEFAULT_RES = 4; // 720p
-const params = new URLSearchParams(location.search);
+const START_RES = 2; // 360p
+const AUTO_MAX = 4;  // auto-res climbs to 720p at most
 const resParam = params.get('res');
-let resIdx = Number(resParam ?? DEFAULT_RES);
-if (!(resIdx >= 0 && resIdx < RES.length)) resIdx = DEFAULT_RES;
+let resIdx = Number(resParam ?? START_RES);
+if (!(resIdx >= 0 && resIdx < RES.length)) resIdx = START_RES;
 let autoRes = resParam === null; // adapt to frame rate; [ or ] sets it by hand, both together go back to auto
+let autoMax = AUTO_MAX;          // lowered for good when a resolution proved too slow
+// The first frames after a change are timed synchronously, so a too-slow resolution is dropped at once.
+const PROBE_FRAMES = 3, SLOW_FRAME_MS = 100;
+let probe = 0;
+const probePixel = new Uint8Array(4);
 function resize() {
   const h = RES[resIdx];
   canvas.height = h;
   canvas.width = Math.max(1, Math.round(h * innerWidth / innerHeight));
   canvas.style.imageRendering = h < 540 ? 'pixelated' : 'auto';
-  makeTargets(canvas.width, canvas.height);
+  if (!gl.isContextLost()) makeTargets(canvas.width, canvas.height);
+  probe = PROBE_FRAMES;
+  updateResButton();
 }
 addEventListener('resize', resize);
-resize();
 
 let msgTimer;
-function msg(text) {
+function msg(text, ms = 2200) {
   if (ui) return; // the save / load panel is using the message area
   msgEl.textContent = text;
   msgEl.style.opacity = 1;
   clearTimeout(msgTimer);
-  msgTimer = setTimeout(() => (msgEl.style.opacity = 0), 2200);
+  msgTimer = setTimeout(() => (msgEl.style.opacity = 0), ms);
 }
+
+// ---- lost WebGL context (GPU watchdog, driver reset, too many contexts): say so and rebuild
+let ctxLost = false, lostTimer;
+canvas.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault(); // without this the browser never restores the context
+  ctxLost = true;
+  endAction();
+  endGesture();
+  // the usual cause is a frame that took too long: come back lower, and don't climb back there
+  if (autoRes && resIdx > 0) {
+    autoMax = Math.min(autoMax, resIdx - 1);
+    resIdx = Math.max(0, resIdx - 2);
+  }
+  showError('the graphics card stopped responding (WebGL context lost)\ntrying to recover…');
+  clearTimeout(lostTimer);
+  lostTimer = setTimeout(() => {
+    if (ctxLost) showError('the graphics card did not come back (WebGL context lost)\nreload the page to try again');
+  }, 6000);
+});
+canvas.addEventListener('webglcontextrestored', () => {
+  try {
+    setupGL();
+    resize();
+  } catch (err) {
+    showError(`could not restore the graphics: ${err.message}\nreload the page to try again`);
+    return;
+  }
+  ctxLost = false;
+  clearTimeout(lostTimer);
+  hideError();
+  msg(`graphics restored at ${RES[resIdx]}p`);
+});
 
 // run something right after the next frame is drawn (the WebGL canvas is only readable then)
 const afterFrame = [];
@@ -185,6 +275,33 @@ function screenshot() {
     msg('screenshot saved');
   }, 'image/png'));
 }
+function defaultName() { return currentName || `room ${Object.keys(readSaves()).length + 1}`; }
+// these return the message to show
+function saveAs(name) {
+  const saves = readSaves();
+  saves[name] = { text: roomText(), at: Date.now() };
+  if (!writeSaves(saves)) return 'could not save: browser storage is full';
+  currentName = name;
+  autosave();
+  return `saved "${name}"`;
+}
+function loadSave(name) {
+  const r = readSaves()[name];
+  if (!(r && loadText(r.text))) return `could not load "${name}"`;
+  currentName = name;
+  autosave();
+  return `loaded "${name}"`;
+}
+function deleteSave(name) {
+  const saves = readSaves();
+  delete saves[name];
+  writeSaves(saves);
+  if (currentName === name) currentName = null;
+}
+function savedNames() {
+  const saves = readSaves();
+  return Object.keys(saves).sort((a, b) => saves[b].at - saves[a].at);
+}
 
 // ---- save / load panel, shown in the message area at the bottom
 // ui = { kind: 'save', text } | { kind: 'load', names, i, del }   (null when closed)
@@ -212,7 +329,7 @@ function closePanel(text) {
 }
 function openSave() {
   keys = 0;
-  ui = { kind: 'save', text: currentName || `room ${Object.keys(readSaves()).length + 1}` };
+  ui = { kind: 'save', text: defaultName() };
   showPanel();
 }
 const FILE_ROW = 'load .room file…';
@@ -242,8 +359,7 @@ function exportRoom(name) {
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 function openLoad() {
-  const saves = readSaves();
-  const names = Object.keys(saves).sort((a, b) => saves[b].at - saves[a].at);
+  const names = savedNames();
   keys = 0;
   ui = { kind: 'load', names, i: Math.max(0, names.indexOf(currentName)), del: false };
   showPanel();
@@ -254,10 +370,7 @@ function panelKey(e) {
     if (e.key === 'Enter') {
       const name = ui.text.trim();
       if (!name) return;
-      const saves = readSaves();
-      saves[name] = { text: roomText(), at: Date.now() };
-      if (writeSaves(saves)) { currentName = name; autosave(); closePanel(`saved "${name}"`); }
-      else closePanel('could not save: browser storage is full');
+      closePanel(saveAs(name));
       return;
     } else if (e.key === 'Backspace') ui.text = ui.text.slice(0, -1);
     else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && ui.text.length < 40) ui.text += e.key;
@@ -269,18 +382,11 @@ function panelKey(e) {
     if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') { ui.i = (ui.i - 1 + n) % n; ui.del = false; }
     else if (e.key === 'ArrowDown' || e.key === 'ArrowRight') { ui.i = (ui.i + 1) % n; ui.del = false; }
     else if (e.key === 'Enter' && onFile) { closePanel(); filePicker.click(); return; }
-    else if (e.key === 'Enter') {
-      const name = ui.names[ui.i], r = readSaves()[name];
-      if (r && loadText(r.text)) { currentName = name; autosave(); closePanel(`loaded "${name}"`); }
-      else closePanel(`could not load "${name}"`);
-      return;
-    } else if (e.key === 'Delete' && !onFile) {
+    else if (e.key === 'Enter') { closePanel(loadSave(ui.names[ui.i])); return; }
+    else if (e.key === 'Delete' && !onFile) {
       if (!ui.del) ui.del = true;
       else {
-        const name = ui.names[ui.i], saves = readSaves();
-        delete saves[name];
-        writeSaves(saves);
-        if (currentName === name) currentName = null;
+        deleteSave(ui.names[ui.i]);
         ui.names.splice(ui.i, 1);
         ui.i = Math.min(ui.i, ui.names.length);
         ui.del = false;
@@ -298,9 +404,16 @@ let preview = false;
 const brackets = new Set();
 function setPreview(on) { if (on !== preview) { preview = on; X.set_preview(on ? 1 : 0); } }
 
+function undo() { if (!X.undo()) msg('nothing to undo'); }
+function redo() { if (!X.redo()) msg('nothing to redo'); }
 function undoRedo(e) {
-  const redo = e.code === 'KeyY' || e.shiftKey;
-  if (!(redo ? X.redo() : X.undo())) msg(redo ? 'nothing to redo' : 'nothing to undo');
+  if (e.code === 'KeyY' || e.shiftKey) redo();
+  else undo();
+}
+function setRes(i) {
+  autoRes = false;
+  resIdx = i;
+  resize();
 }
 
 addEventListener('keydown', (e) => {
@@ -321,11 +434,11 @@ addEventListener('keydown', (e) => {
   if (e.code === 'BracketLeft' || e.code === 'BracketRight') {
     brackets.add(e.code);
     if (brackets.size === 2) {
-      if (!autoRes) { autoRes = true; msg('automatic resolution'); }
+      if (!autoRes) { autoRes = true; updateResButton(); msg('automatic resolution'); }
     } else if (!e.repeat) {
-      autoRes = false;
-      if (e.code === 'BracketLeft' && resIdx > 0) { resIdx--; resize(); }
-      if (e.code === 'BracketRight' && resIdx < RES.length - 1) { resIdx++; resize(); }
+      if (e.code === 'BracketLeft' && resIdx > 0) setRes(resIdx - 1);
+      else if (e.code === 'BracketRight' && resIdx < RES.length - 1) setRes(resIdx + 1);
+      else autoRes = false;
     }
   }
   if (e.code === 'KeyH') showHelp = !showHelp;
@@ -346,6 +459,11 @@ let mode = null; // 'repeat' | 'tiles' | 'shift' (click or drag undecided) | 'er
 let shiftMoved = 0;
 let pushDir = 1, pushStart = 0, repeatTimeout, repeatInterval;
 
+function updateStart() {
+  startEl.textContent = 'click to capture';
+  startEl.style.display = touchMode || locked || errEl.style.display === 'block' ? 'none' : 'block';
+}
+
 // Holding a click repeats it, with steps growing logarithmically with hold time:
 // 25 cm at first, ~1.5 m per repeat after 1 s, ~3 m after 10 s (about 9 repeats per second).
 function pushSteps() {
@@ -364,6 +482,16 @@ function doPush() {
   if (r !== 1 && steps > 1) r = X.grip_step(pushDir); // too far for a big step: try a small one
   report(r);
 }
+// push (dir 1) or pull (-1) the surface under the crosshair, repeating while held; inside group_begin
+function startPush(dir) {
+  if (!X.grip_begin(...C)) return false;
+  pushDir = dir;
+  mode = 'repeat';
+  pushStart = performance.now();
+  doPush();
+  repeatTimeout = setTimeout(() => { if (mode === 'repeat') repeatInterval = setInterval(doPush, 110); }, 380);
+  return true;
+}
 function endAction() {
   if (mode === 'win') X.win_end();
   X.grip_end();
@@ -373,10 +501,19 @@ function endAction() {
   clearInterval(repeatInterval);
   mode = null;
 }
+// window results shared by alt+click and the touch long press; true when a window is held
+function winBegin(sx, sy) {
+  const r = X.win_begin(sx, sy);
+  if (r === 3) msg('no windows in the first 2 m above the floor');
+  else if (r === 4) msg('enough windows');
+  else if (r === 5) msg('too many windows in this room');
+  else if (r === 0) msg('windows go on walls or the ceiling');
+  return r === 1 || r === 2;
+}
 document.addEventListener('pointerlockchange', () => {
   locked = document.pointerLockElement === canvas;
   crosshair.style.display = locked ? 'block' : 'none';
-  startEl.style.display = locked ? 'none' : 'block';
+  updateStart();
   X.set_hover(locked ? 0.5 : -1, locked ? 0.5 : -1);
   if (!locked) { endAction(); keys = 0; setPreview(false); if (ui) closePanel(); } // Esc while captured
 });
@@ -384,28 +521,19 @@ document.addEventListener('pointerlockerror', () => msg('the browser refused to 
 
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 canvas.addEventListener('mousedown', (e) => {
+  if (touchMode) return; // touch controls below
   e.preventDefault();
   if (!locked) { canvas.requestPointerLock(); return; }
   X.group_begin(); // everything until mouseup is one undo step
   if (e.altKey) {
     if (e.button === 2) { if (X.win_delete(...C)) msg('window removed'); return; }
-    const r = X.win_begin(...C);
-    if (r === 3) msg('no windows in the first 2 m above the floor');
-    else if (r === 4) msg('enough windows');
-    else if (r === 5) msg('too many windows in this room');
-    else if (r === 0) msg('windows go on walls or the ceiling');
-    else mode = 'win';
+    if (winBegin(...C)) mode = 'win';
     return;
   }
   if (e.shiftKey && e.button === 0) { mode = 'shift'; shiftMoved = 0; return; } // click: lines, drag: erase
   const t = X.tile_begin(...C); // on the floor: toggle a mirror tile, dragging paints the same onto more tiles
   if (t) { if (t === 3) msg('too many mirror tiles'); mode = 'tiles'; return; }
-  if (!X.grip_begin(...C)) return;
-  pushDir = e.button === 2 ? -1 : 1;
-  mode = 'repeat';
-  pushStart = performance.now();
-  doPush();
-  repeatTimeout = setTimeout(() => { if (mode === 'repeat') repeatInterval = setInterval(doPush, 110); }, 380);
+  startPush(e.button === 2 ? -1 : 1);
 });
 document.addEventListener('mousemove', (e) => {
   if (!locked) return;
@@ -436,9 +564,231 @@ document.addEventListener('mousemove', (e) => {
   }
 });
 document.addEventListener('mouseup', () => {
+  if (touchMode) return;
   if (mode === 'shift') X.add_cross(...C);
   endAction();
 });
+
+// ---- touch: two sticks (walk, look), push / pull buttons, and gestures on the room itself.
+// On the room: tap a wall = preview lines there, tap the preview again = cut them; drag = erase
+// lines; long press = window, keep holding and drag to size it; on the floor: mirror tile, drag paints.
+let look = [0, 0];       // look stick deflection
+let gesture = null;      // { id, x0, y0, x, y, t0, kind: 'pending' | 'tiles' | 'erase' | 'win' | 'none' }
+let previewAt = null;    // [x, y] in css pixels of the previewed lines (touch)
+const TAP_MOVE = 12, NEAR = 40, LONG_PRESS = 450;
+const LOOK_YAW = 2.6, LOOK_PITCH = 1.7; // rad/s at full deflection
+
+function toScreen(x, y) { return [x / innerWidth, y / innerHeight]; }
+function clearPreview() {
+  if (!touchMode) return;
+  setPreview(false);
+  previewAt = null;
+  X.set_hover(0.5, 0.5); // back to the crosshair, the push / pull target
+}
+function showPreviewAt(x, y) {
+  previewAt = [x, y];
+  X.set_hover(...toScreen(x, y));
+  setPreview(true);
+}
+// call fn on screen points from (x0, y0) to (x1, y1) every few pixels, so fast drags skip nothing
+function sweep(x0, y0, x1, y1, fn) {
+  const n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 3));
+  for (let i = 1; i <= n; i++) fn(...toScreen(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n));
+}
+// Long press: checked from the frame loop, which runs after the input events queued behind a slow
+// frame (a timer can fire before such a pointerup and turn a quick tap into a long press).
+function checkLongPress(now) {
+  const g = gesture;
+  if (g?.kind !== 'pending' || now - g.t0 < LONG_PRESS) return;
+  clearPreview();
+  g.kind = winBegin(...toScreen(g.x0, g.y0)) ? 'win' : 'none';
+  if (g.kind === 'win') { navigator.vibrate?.(15); X.win_drag(...toScreen(g.x, g.y)); }
+}
+function endGesture() {
+  if (!gesture) return;
+  if (gesture.kind === 'win') X.win_end();
+  X.tile_end();
+  X.group_end();
+  gesture = null;
+}
+// Browsers only allow fullscreen and orientation lock from a user gesture: try on every touch
+// until it holds (an installed app is already fullscreen and landscape from the manifest).
+function landscape() {
+  const lock = () => screen.orientation?.lock?.('landscape').catch(() => {});
+  if (document.fullscreenElement || matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches) { lock(); return; }
+  document.documentElement.requestFullscreen?.({ navigationUI: 'hide' }).then(lock, () => {});
+}
+
+function setupTouch() {
+  document.addEventListener('pointerup', landscape, true);
+  document.addEventListener('contextmenu', (e) => e.preventDefault());
+  crosshair.style.display = 'block';
+  X.set_hover(0.5, 0.5);
+
+  canvas.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (menuEl.classList.contains('open')) { closeMenu(); return; } // that tap only closes the menu
+    if (gesture || mode || ctxLost) return; // one action at a time
+    canvas.setPointerCapture(e.pointerId);
+    const x = e.clientX, y = e.clientY;
+    const confirming = previewAt && Math.hypot(x - previewAt[0], y - previewAt[1]) < NEAR;
+    if (!confirming) clearPreview();
+    X.group_begin(); // everything until the finger lifts is one undo step
+    gesture = { id: e.pointerId, x0: x, y0: y, x, y, t0: performance.now(), kind: 'pending' }; // from now: the press may have waited behind a slow frame
+    const t = X.tile_begin(...toScreen(x, y));
+    if (t) {
+      clearPreview();
+      if (t === 3) msg('too many mirror tiles');
+      gesture.kind = 'tiles';
+    }
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    const g = gesture;
+    if (!g || e.pointerId !== g.id) return;
+    const px = g.x, py = g.y, x = e.clientX, y = e.clientY;
+    g.x = x;
+    g.y = y;
+    if (g.kind === 'pending' && Math.hypot(x - g.x0, y - g.y0) > TAP_MOVE) {
+      clearPreview();
+      g.kind = 'erase';
+      sweep(g.x0, g.y0, x, y, X.erase);
+    } else if (g.kind === 'erase') sweep(px, py, x, y, X.erase);
+    else if (g.kind === 'tiles') sweep(px, py, x, y, X.tile_drag);
+    else if (g.kind === 'win') X.win_drag(...toScreen(x, y));
+  });
+  const up = (e) => {
+    const g = gesture;
+    if (!g || e.pointerId !== g.id) return;
+    if (g.kind === 'pending' && e.type === 'pointerup') {
+      if (previewAt && Math.hypot(g.x - previewAt[0], g.y - previewAt[1]) < NEAR) {
+        X.add_cross(...toScreen(...previewAt));
+        clearPreview();
+      } else showPreviewAt(g.x, g.y);
+    }
+    endGesture();
+  };
+  canvas.addEventListener('pointerup', up);
+  canvas.addEventListener('pointercancel', up);
+
+  // sticks: x right, y down, each -1..1 with a small dead zone
+  function stick(el, onMove) {
+    const knob = el.firstElementChild;
+    let id = null;
+    const move = (e) => {
+      const r = el.getBoundingClientRect(), R = r.width / 2;
+      let dx = (e.clientX - r.left - R) / R, dy = (e.clientY - r.top - R) / R;
+      const len = Math.hypot(dx, dy);
+      if (len > 1) { dx /= len; dy /= len; }
+      knob.style.transform = `translate(${dx * R * 0.55}px, ${dy * R * 0.55}px)`;
+      const m = Math.min(len, 1); // (dx, dy) is now this long
+      const k = m < 0.12 ? 0 : (m - 0.12) / 0.88 / m;
+      onMove(dx * k, dy * k);
+    };
+    el.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      if (id !== null) return;
+      id = e.pointerId;
+      el.setPointerCapture(id);
+      closeMenu();
+      clearPreview();
+      move(e);
+    });
+    el.addEventListener('pointermove', (e) => { if (e.pointerId === id) move(e); });
+    const release = (e) => {
+      if (e.pointerId !== id) return;
+      id = null;
+      knob.style.transform = '';
+      onMove(0, 0);
+    };
+    el.addEventListener('pointerup', release);
+    el.addEventListener('pointercancel', release);
+  }
+  stick(document.getElementById('walk'), (x, y) => X.set_stick(x, -y));
+  stick(document.getElementById('look'), (x, y) => { look = [x, y]; });
+
+  // push / pull: like holding the mouse button on the surface under the crosshair
+  function hold(el, dir) {
+    el.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      el.setPointerCapture(e.pointerId);
+      closeMenu();
+      clearPreview();
+      if (gesture || mode || ctxLost) return;
+      X.group_begin();
+      if (startPush(dir)) el.classList.add('on');
+      else { X.group_end(); msg('nothing to push here'); }
+    });
+    const release = () => {
+      if (el.classList.contains('on')) endAction();
+      el.classList.remove('on');
+    };
+    el.addEventListener('pointerup', release);
+    el.addEventListener('pointercancel', release);
+  }
+  hold(document.getElementById('push'), 1);
+  hold(document.getElementById('pull'), -1);
+
+  // buttons act on tap
+  const tap = (id, fn) => document.getElementById(id).addEventListener('click', (e) => {
+    e.preventDefault();
+    clearPreview();
+    if (gesture || mode) return;
+    fn();
+  });
+  tap('undo', () => { closeMenu(); undo(); });
+  tap('redo', () => { closeMenu(); redo(); });
+  tap('menubtn', () => (menuEl.classList.contains('open') ? closeMenu() : openMenu()));
+  tap('m-save', () => {
+    closeMenu();
+    const name = prompt('save as', defaultName())?.trim();
+    if (name) msg(saveAs(name));
+  });
+  tap('m-load', () => { closeMenu(); openList(); });
+  tap('m-new', () => { closeMenu(); newRoom(); });
+  tap('m-shot', () => { closeMenu(); screenshot(); });
+  // resolution: auto, then each fixed step, then auto again
+  tap('m-res', () => {
+    if (autoRes) setRes(0);
+    else if (resIdx < RES.length - 1) setRes(resIdx + 1);
+    else { autoRes = true; updateResButton(); }
+  });
+
+  msg('tap a wall: preview lines, tap again: cut · drag: erase · hold: window · floor: mirror', 6000);
+}
+
+// ---- touch menu (save, load, new, screenshot, resolution) and the saved rooms list
+const menuEl = document.getElementById('menu');
+const listEl = document.getElementById('list');
+function openMenu() { menuEl.classList.add('open'); document.getElementById('menubtn').textContent = '▼'; }
+function closeMenu() { menuEl.classList.remove('open'); document.getElementById('menubtn').textContent = '▲'; }
+function updateResButton() {
+  const b = document.getElementById('m-res');
+  if (b) b.textContent = autoRes ? `res: auto (${RES[resIdx]}p)` : `res: ${RES[resIdx]}p`;
+}
+function openList() {
+  listEl.replaceChildren();
+  const button = (text, cls, fn) => {
+    const b = Object.assign(document.createElement('button'), { textContent: text, className: cls });
+    b.addEventListener('click', (e) => { e.preventDefault(); fn(); });
+    return b;
+  };
+  const close = () => { listEl.classList.remove('open'); };
+  const title = Object.assign(document.createElement('div'), { className: 'title', textContent: 'load a room' });
+  listEl.append(title);
+  for (const name of savedNames()) {
+    const row = Object.assign(document.createElement('div'), { className: 'row' });
+    row.append(
+      button(name + (name === currentName ? ' ·' : ''), 'name', () => { close(); msg(loadSave(name)); }),
+      button('export', 'small', () => { exportRoom(name); msg(`exported "${name}.room"`); }),
+      button('delete', 'small', () => { if (confirm(`delete "${name}"?`)) { deleteSave(name); row.remove(); } }),
+    );
+    listEl.append(row);
+  }
+  const foot = Object.assign(document.createElement('div'), { className: 'row' });
+  foot.append(button(FILE_ROW, 'name', () => { close(); filePicker.click(); }), button('close', 'small', close));
+  listEl.append(foot);
+  listEl.classList.add('open');
+}
 
 // ---- frame loop
 const HELP = [
@@ -517,14 +867,40 @@ function render() {
   for (const f of afterFrame.splice(0)) f(canvas);
 }
 
+// Time a frame to completion (readPixels waits for the GPU); drop the resolution at once if it is slow.
+function probeFrame(t0) {
+  probe--;
+  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, probePixel);
+  const ms = performance.now() - t0;
+  if (sinceSetup <= 1 || ms <= SLOW_FRAME_MS || !autoRes || resIdx === 0) return;
+  // cost follows the pixel count: aim for ~40 ms
+  const want = RES[resIdx] * Math.sqrt(40 / ms);
+  let i = resIdx - 1;
+  while (i > 0 && RES[i] > want) i--;
+  autoMax = Math.min(autoMax, resIdx - 1);
+  resIdx = i;
+  resize();
+  slow = fast = 0;
+  console.info(`rooms: a frame took ${Math.round(ms)} ms, rendering at ${RES[i]}p`);
+}
+
 let crashed = false;
 function loop(now) {
   requestAnimationFrame(loop); // first, so an error below can't stop the loop
   const dt = Math.max(0, (now - last) / 1000);
   last = now;
+  if (ctxLost) return;
   try {
+    if (look[0] || look[1]) {
+      const c = (a) => a * Math.abs(a); // gentle near the centre
+      X.look(c(look[0]) * LOOK_YAW * Math.min(dt, 0.1), c(look[1]) * LOOK_PITCH * Math.min(dt, 0.1));
+    }
+    if (gesture) checkLongPress(performance.now());
     X.update(dt, keys);
+    const t0 = performance.now();
     render();
+    sinceSetup++;
+    if (probe > 0) probeFrame(t0);
   } catch (err) {
     if (!crashed) { crashed = true; console.error(err); msg('engine error, see the browser console (reload to recover)'); }
     return;
@@ -538,11 +914,16 @@ function loop(now) {
       slow = fps < 27 ? slow + 1 : 0;
       fast = fps > 55 ? fast + 1 : 0;
       if (slow >= 2 && resIdx > 0) { resIdx--; resize(); slow = 0; }
-      else if (fast >= 3 && resIdx < DEFAULT_RES) { resIdx++; resize(); fast = 0; }
+      else if (fast >= 3 && resIdx < autoMax) { resIdx++; resize(); fast = 0; }
     }
     frames = 0;
     fpsT = now;
   }
-  hud.textContent = `rooms · ${fpsShown}fps@${canvas.width}x${canvas.height} · 'H' help` + (showHelp ? '\n\n' + HELP : '');
+  hud.textContent = `rooms · ${fpsShown}fps@${canvas.width}x${canvas.height}` + (touchMode ? '' : ` · 'H' help` + (showHelp ? '\n\n' + HELP : ''));
 }
+
+resize();
+if (touchMode) setupTouch();
+updateStart();
+started = true;
 requestAnimationFrame(loop);

@@ -5,5 +5,5 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ./build.sh
 mkdir -p /var/www/rooms
-cp web/index.html web/main.js web/shader.js web/rooms.wasm /var/www/rooms/
+cp web/*.html web/*.js web/*.wasm web/*.webmanifest web/*.png web/*.ico /var/www/rooms/
 echo "deployed to /var/www/rooms"

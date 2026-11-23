@@ -679,6 +679,7 @@ struct State {
     pos: V,
     vel: (f32, f32), // horizontal velocity (x, z)
     walk_t: f32,     // how long a move key has been held (s)
+    stick: (f32, f32), // touch joystick (right, forward), each -1..1; used when no key is held
     yaw: f32,
     pitch: f32,
     w: usize,
@@ -720,6 +721,7 @@ impl State {
             pos: v(-0.55, EYE, 1.05),
             vel: (0.0, 0.0),
             walk_t: 0.0,
+            stick: (0.0, 0.0),
             yaw: 0.42,
             pitch: 0.12,
             w: 0,
@@ -1381,7 +1383,9 @@ impl State {
         if !self.preview {
             return [0.0; 6];
         }
-        match self.pick(0.5, 0.5) {
+        // at the hover point: the crosshair, or where a touch screen was tapped
+        let (sx, sy) = if self.hover.0 >= 0.0 { self.hover } else { (0.5, 0.5) };
+        match self.pick(sx, sy) {
             Some(h) if !h.is_ground() => {
                 let (u, w) = h.uv();
                 let flat_ok = h.axis == 1 || w >= CLEAR - 1e-3; // horizontal line allowed here?
@@ -1591,11 +1595,19 @@ pub extern "C" fn update(dt: f32, keys: u32) {
         mx += rx;
         mz += rz;
     }
+    // touch joystick: its direction, and its deflection scales the speed
+    let mut throttle = 1.0;
+    if keys & 15 == 0 {
+        let (sx, sy) = s.stick;
+        mx = fx * sy + rx * sx;
+        mz = fz * sy + rz * sx;
+        throttle = (sx * sx + sy * sy).sqrt().min(1.0);
+    }
     // inertia: steer the velocity toward the wanted one at a limited rate;
     // the longer a key is held, the higher the top speed
     let len = (mx * mx + mz * mz).sqrt();
     s.walk_t = if len > 1e-6 { s.walk_t + dt } else { 0.0 };
-    let top = SPEED * (1.0 + WALK_GROWTH * (1.0 + s.walk_t / WALK_TAU).ln());
+    let top = SPEED * (1.0 + WALK_GROWTH * (1.0 + s.walk_t / WALK_TAU).ln()) * throttle;
     let (tx, tz) = if len > 1e-6 { (mx / len * top, mz / len * top) } else { (0.0, 0.0) };
     let (dx, dz) = (tx - s.vel.0, tz - s.vel.1);
     let dist = (dx * dx + dz * dz).sqrt();
@@ -1629,6 +1641,13 @@ pub extern "C" fn update(dt: f32, keys: u32) {
     s.dirty = true;
 }
 
+/// Touch joystick for walking: x right, y forward, each -1..1 (0, 0 = released).
+#[no_mangle]
+pub extern "C" fn set_stick(x: f32, y: f32) {
+    let ok = |a: f32| if a.is_finite() { a.clamp(-1.0, 1.0) } else { 0.0 };
+    st().stick = (ok(x), ok(y));
+}
+
 #[no_mangle]
 pub extern "C" fn look(dyaw: f32, dpitch: f32) {
     let s = st();
@@ -1642,7 +1661,8 @@ pub extern "C" fn set_hover(sx: f32, sy: f32) {
     st().hover = (sx, sy);
 }
 
-/// Ctrl held: preview the vertical + horizontal line under the crosshair.
+/// Shift held (or a tap on a touch screen): preview the vertical + horizontal line under the
+/// hover point (set_hover), or the crosshair when there is none.
 #[no_mangle]
 pub extern "C" fn set_preview(on: i32) {
     st().preview = on != 0;
@@ -2351,6 +2371,36 @@ mod tests {
     }
 
     #[test]
+    fn joystick_walks_with_speed_from_its_deflection() {
+        // top forward speed reached with the stick at `y` (the wall ends the walk)
+        let peak = |y: f32| {
+            setup(0.0, 1.0);
+            st().yaw = 0.0;
+            set_stick(0.0, y);
+            let mut top = 0.0f32;
+            for _ in 0..20 {
+                update(0.05, 0);
+                assert!(st().vel.0.abs() < 1e-4, "straight ahead: {:?}", st().vel);
+                top = top.max(-st().vel.1);
+            }
+            top
+        };
+        let (half, full) = (peak(0.5), peak(1.0));
+        assert!(half > 0.5 && full > half * 1.5, "half {half}, full {full}");
+        // a held key wins over the stick
+        setup(0.0, 0.0);
+        st().yaw = 0.0;
+        set_stick(1.0, 0.0);
+        update(0.05, 1);
+        assert!(st().vel.1 < 0.0 && st().vel.0.abs() < 1e-4, "{:?}", st().vel);
+        set_stick(0.0, 0.0);
+        for _ in 0..40 {
+            update(0.05, 0);
+        }
+        assert_eq!(st().vel, (0.0, 0.0));
+    }
+
+    #[test]
     fn fast_walking_does_not_tunnel_through_thin_walls() {
         setup(0.0, 0.0);
         st().yaw = 0.0;
@@ -2381,6 +2431,18 @@ mod tests {
         aim(v(1.2, 2.0, 0.0));
         assert_eq!(push(0.5, 0.5, 1.0), 1);
         assert!(free(v(1.1, 0.1, 0.0)), "the block is gone: nothing between the ground and 2 m");
+    }
+
+    #[test]
+    fn line_preview_follows_the_hover_point() {
+        setup(0.0, 0.0);
+        aim(v(1.5, 2.4, 0.0));
+        st().preview = true;
+        let centre = st().make_preview();
+        set_hover(0.3, 0.5); // a tap left of the crosshair
+        let tapped = st().make_preview();
+        assert_eq!(tapped[0], 1.0);
+        assert!((tapped[4] - centre[4]).abs() > 0.1, "lines move with the tap: {centre:?} {tapped:?}");
     }
 
     #[test]
