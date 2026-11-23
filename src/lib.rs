@@ -60,7 +60,13 @@ fn sun_dir() -> V {
 const SKYCOL: V = v(0.75, 0.86, 1.0);
 const INF: f32 = 1e30;
 /// Uniform block layout (floats), mirrored in web/main.js.
-const U_LEN: usize = 176;
+const U_LEN: usize = 192;
+/// Floor tiles are TILE x TILE metres (the grout lines in the shader match). Any tile
+/// can be toggled into a mirror; the mirror mask is sent as a box of at most
+/// MIRROR_SPAN x MIRROR_SPAN tiles.
+const TILE: f32 = 0.6;
+const MIRROR_SPAN: i32 = 512;
+const MIRROR_R: f32 = 0.85; // how much light a mirror tile reflects
 
 // ---------------------------------------------------------------- vectors
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
@@ -598,6 +604,7 @@ struct Snap {
     grid: Grid,
     lines: HashMap<Key, Lines>,
     wins: Vec<Win>,
+    mirrors: HashSet<(i32, i32)>,
 }
 
 /// A virtual point light: a spot where window light lands, re-emitting it.
@@ -636,6 +643,9 @@ struct State {
     grid: Grid,
     lines: HashMap<Key, Lines>,
     wins: Vec<Win>,
+    mirrors: HashSet<(i32, i32)>, // floor tiles that are mirrors
+    tile_last: Option<(i32, i32)>, // tile toggled last during a click-drag
+    tile_hover: Option<(i32, i32)>,
     pos: V,
     vel: (f32, f32), // horizontal velocity (x, z)
     walk_t: f32,     // how long a move key has been held (s)
@@ -673,6 +683,9 @@ impl State {
         State {
             grid: Grid::new(),
             lines: HashMap::new(),
+            mirrors: HashSet::new(),
+            tile_last: None,
+            tile_hover: None,
             wins: vec![Win { axis: 2, s: 1.0, pos: -1.5, uc: 0.25, vc: 2.62, hu: 0.32, hv: 0.18 }],
             pos: v(-0.55, EYE, 1.05),
             vel: (0.0, 0.0),
@@ -754,6 +767,14 @@ impl State {
         for w in &self.wins {
             let _ = writeln!(o, "{} {} {} {} {} {} {}", w.axis, w.s, w.pos, w.uc, w.vc, w.hu, w.hv);
         }
+        // mirror tiles (optional section, absent in older saves)
+        let mut tiles: Vec<_> = self.mirrors.iter().collect();
+        tiles.sort();
+        let _ = write!(o, "{}", tiles.len());
+        for (i, j) in tiles {
+            let _ = write!(o, " {i} {j}");
+        }
+        o.push('\n');
         o
     }
 
@@ -824,6 +845,17 @@ impl State {
             }
             wins.push(w);
         }
+        let mut mirrors = HashSet::new();
+        if let Some(n) = num() {
+            for _ in 0..int(n)? {
+                let (i, j) = (num()?, num()?);
+                if i.fract() != 0.0 || j.fract() != 0.0 {
+                    return None;
+                }
+                mirrors.insert((i as i32, j as i32));
+            }
+        }
+        self.mirrors = mirrors;
         self.grid = Grid { c, occ };
         self.lines = lines;
         self.wins = wins;
@@ -839,7 +871,7 @@ impl State {
 
     // ---- undo
     fn snap(&self) -> Snap {
-        Snap { grid: self.grid.clone(), lines: self.lines.clone(), wins: self.wins.clone() }
+        Snap { grid: self.grid.clone(), lines: self.lines.clone(), wins: self.wins.clone(), mirrors: self.mirrors.clone() }
     }
     fn changed(&mut self) {
         self.dirty = true;
@@ -863,13 +895,48 @@ impl State {
         self.grid = s.grid;
         self.lines = s.lines;
         self.wins = s.wins;
+        self.mirrors = s.mirrors;
     }
     fn restore(&mut self, s: Snap) {
         self.grid = s.grid;
         self.lines = s.lines;
         self.wins = s.wins;
+        self.mirrors = s.mirrors;
         self.drag_win = None;
         self.changed();
+    }
+
+    // ---- mirror tiles
+    fn tile_of(p: V) -> (i32, i32) {
+        ((p.x / TILE).floor() as i32, (p.z / TILE).floor() as i32)
+    }
+    fn is_mirror(&self, p: V) -> bool {
+        self.mirrors.contains(&State::tile_of(p))
+    }
+    /// The ground tile under the screen point, if the crosshair is on the ground.
+    fn ground_tile(&self, sx: f32, sy: f32) -> Option<(i32, i32)> {
+        self.pick(sx, sy).filter(|h| h.is_ground()).map(|h| State::tile_of(h.p))
+    }
+    /// Toggle a tile; false if it would make the mirror area too large to send.
+    fn toggle_tile(&mut self, t: (i32, i32)) -> bool {
+        if !self.mirrors.contains(&t) && !self.mirrors.is_empty() {
+            let (mut i0, mut i1, mut j0, mut j1) = (t.0, t.0, t.1, t.1);
+            for &(i, j) in &self.mirrors {
+                i0 = i0.min(i);
+                i1 = i1.max(i);
+                j0 = j0.min(j);
+                j1 = j1.max(j);
+            }
+            if i1 - i0 >= MIRROR_SPAN || j1 - j0 >= MIRROR_SPAN {
+                return false;
+            }
+        }
+        let before = self.snap();
+        if !self.mirrors.remove(&t) {
+            self.mirrors.insert(t);
+        }
+        self.commit(before);
+        true
     }
 
     // ---- camera
@@ -1152,8 +1219,19 @@ impl State {
                 if !self.grid.sun_clear(w.point(fu, fv) - nin * 2e-3, -beam) {
                     continue; // another part of the room shades this bit of the window
                 }
-                if let Some(h) = self.trace(w.point(fu, fv) + nin * 2e-3, beam, INF) {
-                    let pw = SUN * w.area() * cw / VPL_SUN as f32 * BOUNCE;
+                if let Some(mut h) = self.trace(w.point(fu, fv) + nin * 2e-3, beam, INF) {
+                    let mut pw = SUN * w.area() * cw / VPL_SUN as f32 * BOUNCE;
+                    if h.is_ground() && self.is_mirror(h.p) {
+                        // the beam bounces off a mirror tile and lands somewhere else
+                        let up = v(beam.x, -beam.y, beam.z);
+                        match self.trace(h.p + v(0.0, 2e-3, 0.0), up, INF) {
+                            Some(h2) => {
+                                h = h2;
+                                pw *= MIRROR_R;
+                            }
+                            None => continue,
+                        }
+                    }
                     out.push(Vpl { p: h.p + h.n * 2e-3, n: h.n, power: SUNCOL.mulv(albedo(&h)) * pw });
                 }
             }
@@ -1223,6 +1301,11 @@ impl State {
             self.hover_desc = hd;
             self.dirty = true;
         }
+        let th = if self.hover.0 >= 0.0 { self.ground_tile(self.hover.0, self.hover.1) } else { None };
+        if th != self.tile_hover {
+            self.tile_hover = th;
+            self.dirty = true;
+        }
         let pd = self.make_preview();
         if pd != self.preview_at {
             self.preview_at = pd;
@@ -1279,6 +1362,24 @@ impl State {
             u[37] = ((self.hover_desc.len() - 3) / 4) as f32;
         }
         u[36] = hover_off as f32;
+        if !self.mirrors.is_empty() {
+            let i0 = self.mirrors.iter().map(|t| t.0).min().unwrap();
+            let i1 = self.mirrors.iter().map(|t| t.0).max().unwrap();
+            let j0 = self.mirrors.iter().map(|t| t.1).min().unwrap();
+            let j1 = self.mirrors.iter().map(|t| t.1).max().unwrap();
+            let (w, h) = ((i1 - i0 + 1) as usize, (j1 - j0 + 1) as usize);
+            let off = d.len();
+            d.resize(off + w * h, 0.0);
+            for &(i, j) in &self.mirrors {
+                d[off + (i - i0) as usize + (j - j0) as usize * w] = 1.0;
+            }
+            u[176..181].copy_from_slice(&[off as f32, i0 as f32, j0 as f32, w as f32, h as f32]);
+        }
+        if let Some((i, j)) = self.tile_hover {
+            u[39] = 1.0;
+            u[46] = i as f32;
+            u[47] = j as f32;
+        }
         let vpl_off = d.len();
         for l in &vpl {
             d.extend_from_slice(&[l.p.x, l.p.y, l.p.z, l.n.x, l.n.y, l.n.z, l.power.x, l.power.y, l.power.z]);
@@ -1458,11 +1559,41 @@ pub extern "C" fn push(sx: f32, sy: f32, dir: f32) -> i32 {
         s.cleanup();
         s.commit(before);
     } else {
-        s.grid = before.grid;
-        s.lines = before.lines;
-        s.wins = before.wins;
+        s.restore_quiet(before);
     }
     r
+}
+
+/// Click on the ground: toggle the floor tile under the crosshair into / out of a
+/// mirror. 1 = toggled, 0 = not on the ground, 3 = mirror area too large.
+#[no_mangle]
+pub extern "C" fn tile_begin(sx: f32, sy: f32) -> i32 {
+    let s = st();
+    s.tile_last = None;
+    let Some(t) = s.ground_tile(sx, sy) else { return 0 };
+    s.tile_last = Some(t);
+    if s.toggle_tile(t) { 1 } else { 3 }
+}
+
+/// Dragging after tile_begin: every tile the crosshair enters is toggled (entering a
+/// tile again toggles it again). Returns 1 if a tile was toggled.
+#[no_mangle]
+pub extern "C" fn tile_drag(sx: f32, sy: f32) -> i32 {
+    let s = st();
+    let t = s.ground_tile(sx, sy);
+    if t == s.tile_last {
+        return 0;
+    }
+    s.tile_last = t;
+    match t {
+        Some(t) => s.toggle_tile(t) as i32,
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tile_end() {
+    st().tile_last = None;
 }
 
 /// Press on a surface: lock its region for grip_step (held clicks, E-drag).
@@ -1808,6 +1939,7 @@ pub extern "C" fn reset() {
     s.grid = fresh.grid;
     s.lines = fresh.lines;
     s.wins = fresh.wins;
+    s.mirrors = fresh.mirrors;
     s.pos = fresh.pos;
     s.yaw = fresh.yaw;
     s.pitch = fresh.pitch;
@@ -2255,6 +2387,53 @@ mod tests {
             }
         }
         assert_eq!(sun_vpls(st()), 0, "the wing above and behind the window blocks the sun");
+    }
+
+    #[test]
+    fn floor_tiles_toggle_into_mirrors() {
+        setup(0.3, 0.3);
+        aim(v(0.9, 0.0, 0.3)); // tile (1, 0)
+        group_begin();
+        assert_eq!(tile_begin(0.5, 0.5), 1);
+        assert!(st().mirrors.contains(&(1, 0)));
+        // sweep onto the next tile, back, and on again: each entry toggles
+        aim(v(0.3, 0.0, 0.3)); // tile (0, 0)
+        assert_eq!(tile_drag(0.5, 0.5), 1);
+        aim(v(0.31, 0.0, 0.32)); // same tile: nothing
+        assert_eq!(tile_drag(0.5, 0.5), 0);
+        aim(v(0.9, 0.0, 0.3)); // back onto (1, 0): toggled off again
+        assert_eq!(tile_drag(0.5, 0.5), 1);
+        tile_end();
+        group_end();
+        assert!(st().mirrors.contains(&(0, 0)) && !st().mirrors.contains(&(1, 0)));
+        // walls are not tiles
+        aim(v(1.5, 1.6, 0.0));
+        assert_eq!(tile_begin(0.5, 0.5), 0);
+        // saved with the room, and the whole sweep is one undo step
+        let text = st().serialize();
+        assert!(text.trim_end().ends_with("1 0 0"));
+        assert_eq!(undo(), 1);
+        assert!(st().mirrors.is_empty());
+        // older saves without the mirror section still load
+        let old = text.trim_end().rsplit_once('\n').unwrap().0.to_string();
+        let ptr = alloc(old.len() as u32);
+        unsafe { std::ptr::copy_nonoverlapping(old.as_ptr(), ptr, old.len()) };
+        assert_eq!(load(old.len() as u32), 1);
+    }
+
+    #[test]
+    fn sun_bounces_off_a_mirror_tile() {
+        setup(-1.2, 1.2);
+        let count_floor = |s: &State| s.vpls().iter().take(VPL_SUN).filter(|l| l.n.y > 0.5).count();
+        let before = count_floor(st());
+        assert!(before > 8, "the sun patch starts on the floor");
+        // mirror every tile in the patch area
+        for i in -3..3 {
+            for j in -3..3 {
+                st().mirrors.insert((i, j));
+            }
+        }
+        assert_eq!(count_floor(st()), 0, "the beam now bounces up off the mirrors");
     }
 
     #[test]

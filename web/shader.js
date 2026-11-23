@@ -28,6 +28,8 @@ uniform int uNPlanes, uPlaneOff;     // plane table: (axis, sign, pos, nu, nv, o
 uniform vec4 uHover;                 // on, axis, sign, pos
 uniform int uHoverOff, uHoverN;      // rects (u0, u1, v0, v1) in uData
 uniform int uHoverMode;              // 1 = E held: the region is ready to extrude
+uniform int uMirOff, uMirI0, uMirJ0, uMirW, uMirH; // mirror floor tiles: a w x h mask in uData
+uniform vec3 uTileHover;             // on, i, j: the floor tile under the crosshair
 uniform vec4 uPreview;               // on, axis, sign, pos
 uniform vec2 uPreview2;              // u, v
 uniform vec4 uWin[32];               // per window: (axis, sign, pos, area) (ua, va, -, -) (u0, u1, v0, v1) (sun direction, -)
@@ -48,6 +50,9 @@ const float FOG_BASE = 0.035;  // faint glow of the mist itself: far space fades
 const vec3 SUNCOL = vec3(1.0, 0.88, 0.70);
 const vec3 SKYCOL = vec3(0.75, 0.86, 1.0);
 const int VPL_PER_PIXEL = 3;
+const float TILE = 0.6;                      // floor tile size (src/lib.rs TILE)
+const vec3 MIRROR = vec3(0.85, 0.87, 0.9);   // mirror tile reflectance (src/lib.rs MIRROR_R)
+const float MIRROR_R = 0.85;
 const int FOG_STEPS = 3;
 
 uint rs;
@@ -132,6 +137,13 @@ bool sunClear(vec3 o, vec3 d) {
   return true;
 }
 
+bool isMirror(vec3 p) {
+  if (uMirW == 0) return false;
+  int i = int(floor(p.x / TILE)) - uMirI0, j = int(floor(p.z / TILE)) - uMirJ0;
+  if (i < 0 || j < 0 || i >= uMirW || j >= uMirH) return false;
+  return D(uMirOff + i + j * uMirW) > 0.5;
+}
+
 float hitSign(Hit h, vec3 d) { return d[h.axis] > 0.0 ? -1.0 : 1.0; }
 float hitPos(Hit h) { return cutv(h.axis, h.k); }
 
@@ -173,6 +185,26 @@ vec3 direct(vec3 p, vec3 n, ivec3 c) {
         Hit h;
         if (trace(p, ld, c, t + 0.02, h) && windowAt(h, hitSign(h, ld), p + ld * h.t) == w && sunClear(p + ld * (h.t + 2e-3), ld))
           e += SUNCOL * (SUN * cb);
+      }
+    }
+    // sun reflected off a mirror tile: from p down to the floor, then up to the sun
+    if (uMirW > 0) {
+      vec3 lr = vec3(ld.x, -ld.y, ld.z);  // toward the sun's mirror image (downward)
+      float cr = dot(n, lr);
+      if (cr > 0.0 && lr.y < -1e-4 && p.y > 1e-3) {
+        float tm = -p.y / lr.y;
+        vec3 m = p + lr * tm;
+        Hit h;
+        if (isMirror(m) && trace(p, lr, c, tm + 0.02, h) && h.axis == 1 && abs(h.t - tm) < 0.01) {
+          vec3 mp = m + vec3(0.0, 1e-3, 0.0);
+          float t2 = (wpos - mp[ax]) / ld[ax];
+          vec3 q = mp + ld * t2;
+          Hit h2;
+          if (ld[ax] * ws < -1e-4 && t2 > 0.0 && q[ua] > r.x && q[ua] < r.y && q[va] > r.z && q[va] < r.w
+              && trace(mp, ld, h.cell, t2 + 0.02, h2) && windowAt(h2, hitSign(h2, ld), mp + ld * h2.t) == w
+              && sunClear(mp + ld * (h2.t + 2e-3), ld))
+            e += SUNCOL * (SUN * MIRROR_R * cr);
+        }
       }
     }
     // sky through the window (area light, one sample)
@@ -232,10 +264,12 @@ vec3 albedo(Hit h, float s, vec3 p) {
   vec3 a;
   if (h.axis == 1 && s > 0.0 && pos < 1e-3) {
     // the ground
-    a = vec3(0.40, 0.38, 0.35);
-    vec2 f = fract(p.xz / 0.6);
+    a = isMirror(p) ? vec3(0.06) : vec3(0.40, 0.38, 0.35);
+    vec2 f = fract(p.xz / TILE);
     float w = 0.01 + 0.002 * h.t;
     if (f.x < w || f.x > 1.0 - w || f.y < w || f.y > 1.0 - w) a *= 0.8;
+    if (uTileHover.x > 0.5 && floor(p.x / TILE) == uTileHover.y && floor(p.z / TILE) == uTileHover.z)
+      a = a * vec3(0.93, 1.0, 1.12) + vec3(0.02, 0.03, 0.05);
     return a;
   }
   a = (h.axis == 1 && s < 0.0) ? vec3(0.80, 0.79, 0.76) : vec3(0.78, 0.74, 0.64);
@@ -286,6 +320,31 @@ vec3 fog(vec3 o, vec3 d, float thit) {
           l += SUNCOL * (SHAFT * ph * SHAFT_SIGMA * dt * exp(-SIGMA * t));
       }
     }
+    // shafts of sunlight reflected up off mirror tiles (sampled at random points)
+    if (uMirW > 0 && ld[ax] * ws < -1e-4) {
+      vec3 bm = vec3(beam.x, -beam.y, beam.z), lr = -bm;  // reflected beam travels up; lr goes down to the mirror
+      float g = 0.55, cs = dot(bm, -d);
+      float ph = (1.0 - g * g) / (4.0 * PI * pow(1.0 + g * g - 2.0 * g * cs, 1.5));
+      float tl = min(thit, 30.0);
+      for (int k = 0; k < 2; k++) {
+        float t = (float(k) + rnd()) * 0.5 * tl;
+        vec3 x = o + d * t;
+        if (x.y <= 1e-3) continue;
+        float tm = -x.y / lr.y;
+        vec3 m = x + lr * tm;
+        if (!isMirror(m)) continue;
+        Hit h;
+        ivec3 cx = cellAt(x);
+        if (!trace(x, lr, cx, tm + 0.02, h) || h.axis != 1 || abs(h.t - tm) > 0.01) continue;
+        vec3 mp = m + vec3(0.0, 1e-3, 0.0);
+        float t2 = (wpos - mp[ax]) / ld[ax];
+        vec3 q = mp + ld * t2;
+        if (t2 <= 0.0 || q[ua] <= r.x || q[ua] >= r.y || q[va] <= r.z || q[va] >= r.w) continue;
+        Hit h2;
+        if (trace(mp, ld, h.cell, t2 + 0.02, h2) && windowAt(h2, hitSign(h2, ld), mp + ld * h2.t) == w && sunClear(mp + ld * (h2.t + 2e-3), ld))
+          l += SUNCOL * (SHAFT * MIRROR_R * ph * SHAFT_SIGMA * 0.5 * tl * exp(-SIGMA * t));
+      }
+    }
     float tl = min(thit, 25.0), t = rnd() * tl;
     vec3 x = o + d * t;
     vec3 lv = winPoint(w, rnd(), rnd()) - x;
@@ -300,24 +359,39 @@ vec3 fog(vec3 o, vec3 d, float thit) {
 }
 
 vec3 radiance(vec3 o, vec3 d) {
-  Hit h;
-  if (!trace(o, d, uCamCell, INF, h)) return vec3(0.0);
-  vec3 p = o + d * h.t;
-  float s = hitSign(h, d);
-  vec3 L;
-  if (windowAt(h, s, p) >= 0) {
-    L = SKYCOL * SKY_VIEW;
-  } else {
-    vec3 n = unitv(h.axis, s);
-    vec3 pp = p + n * 1e-3;
-    L = albedo(h, s, p) * (direct(pp, n, h.cell) + indirect(pp, n, h.cell)) / PI;
-    if (uPreview.x > 0.5 && int(uPreview.y) == h.axis && uPreview.z == s && abs(uPreview.w - hitPos(h)) < 1e-3) {
-      ivec2 uv = uvAxes(h.axis);
-      float w = 0.003 + 0.002 * h.t;
-      if (abs(p[uv.x] - uPreview2.x) < w || abs(p[uv.y] - uPreview2.y) < w) L = L * 0.4 + vec3(0.30, 0.24, 0.14);
+  vec3 acc = vec3(0.0), thr = vec3(1.0);
+  ivec3 cell = uCamCell;
+  for (int bounce = 0; bounce < 3; bounce++) {
+    Hit h;
+    if (!trace(o, d, cell, INF, h)) return acc;
+    vec3 p = o + d * h.t;
+    float s = hitSign(h, d);
+    acc += thr * fog(o, d, h.t);
+    thr *= exp(-SIGMA * h.t);
+    if (bounce < 2 && h.axis == 1 && s > 0.0 && hitPos(h) < 1e-3 && isMirror(p)) {
+      // a mirror tile: carry on along the reflected ray
+      thr *= MIRROR;
+      o = p + vec3(0.0, 1e-3, 0.0);
+      d.y = -d.y;
+      cell = h.cell;
+      continue;
     }
+    vec3 L;
+    if (windowAt(h, s, p) >= 0) {
+      L = SKYCOL * SKY_VIEW;
+    } else {
+      vec3 n = unitv(h.axis, s);
+      vec3 pp = p + n * 1e-3;
+      L = albedo(h, s, p) * (direct(pp, n, h.cell) + indirect(pp, n, h.cell)) / PI;
+      if (bounce == 0 && uPreview.x > 0.5 && int(uPreview.y) == h.axis && uPreview.z == s && abs(uPreview.w - hitPos(h)) < 1e-3) {
+        ivec2 uv = uvAxes(h.axis);
+        float w = 0.003 + 0.002 * h.t;
+        if (abs(p[uv.x] - uPreview2.x) < w || abs(p[uv.y] - uPreview2.y) < w) L = L * 0.4 + vec3(0.30, 0.24, 0.14);
+      }
+    }
+    return acc + thr * L;
   }
-  return L * exp(-SIGMA * h.t) + fog(o, d, h.t);
+  return acc;
 }
 
 void main() {

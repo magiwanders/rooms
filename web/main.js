@@ -357,7 +357,7 @@ addEventListener('blur', () => { keys = 0; brackets.clear(); setPreview(false); 
 const C = [0.5, 0.5];
 const SENS = 0.0025;
 let locked = false;
-let mode = null; // 'repeat' | 'extrude' | 'shift' (click or drag undecided) | 'erase' | 'win'
+let mode = null; // 'repeat' | 'extrude' | 'tiles' | 'shift' (click or drag undecided) | 'erase' | 'win'
 let extAcc = 0, extDist = 1; // extrude: metres of mouse travel not applied yet; distance to the surface
 let shiftMoved = 0;
 let pushDir = 1, pushStart = 0, repeatTimeout, repeatInterval;
@@ -382,6 +382,7 @@ function doPush() {
 function endAction() {
   if (mode === 'win') X.win_end();
   X.grip_end();
+  X.tile_end();
   X.group_end();
   clearTimeout(repeatTimeout);
   clearInterval(repeatInterval);
@@ -411,7 +412,9 @@ canvas.addEventListener('mousedown', (e) => {
     return;
   }
   if (e.shiftKey && e.button === 0) { mode = 'shift'; shiftMoved = 0; return; } // click: lines, drag: erase
-  if (!X.grip_begin(...C)) return; // nothing movable there (the ground)
+  const t = X.tile_begin(...C); // on the floor: toggle mirror tiles, dragging toggles every tile entered
+  if (t) { if (t === 3) msg('mirrors too far apart'); mode = 'tiles'; return; }
+  if (!X.grip_begin(...C)) return;
   if (eHeld) { mode = 'extrude'; extAcc = 0; extDist = Math.max(0.5, X.pick_dist(...C)); return; }
   pushDir = e.button === 2 ? -1 : 1;
   mode = 'repeat';
@@ -436,6 +439,15 @@ document.addEventListener('mousemove', (e) => {
       if (r !== 1 && Math.abs(n) > 1) { moved = Math.sign(n); r = X.grip_step(moved); }
       if (r === 1) { extAcc -= moved * 0.25; extDist = Math.max(0.5, extDist + moved * 0.25); }
       else { extAcc = 0; report(r); }
+    }
+    return;
+  }
+  if (mode === 'tiles') {
+    // sweep in small steps so fast moves don't skip tiles
+    const n = Math.max(1, Math.ceil(Math.hypot(dx, dy) / 3));
+    for (let i = 0; i < n; i++) {
+      X.look((dx / n) * SENS, (dy / n) * SENS);
+      X.tile_drag(...C);
     }
     return;
   }
@@ -464,6 +476,7 @@ const HELP = [
   ['click', 'push'],
   ['right click', 'pull'],
   ['e+drag', 'extrude (drag up / down)'],
+  ['click floor', 'mirror tile (drag: more tiles)'],
   ['shift+click', 'vertical and horizontal line'],
   ['shift+drag', 'erase lines'],
   ['alt+click', 'window, hold and aim to resize'],
@@ -480,7 +493,7 @@ let last = performance.now(), fpsT = last, frames = 0, fpsShown = 0, slow = 0, f
 
 function render() {
   const w = canvas.width, h = canvas.height;
-  const u = new Float32Array(X.memory.buffer, X.frame(w, h), 176).slice();
+  const u = new Float32Array(X.memory.buffer, X.frame(w, h), 192).slice();
   uploadData(X.data_ptr(), X.data_len());
   uploadOcc(u[31]);
   const src = acc[frameNo & 1], dst = acc[(frameNo + 1) & 1];
@@ -516,6 +529,12 @@ function render() {
   gl.uniform1i(L.uHoverOff, u[36]);
   gl.uniform1i(L.uHoverN, u[37]);
   gl.uniform1i(L.uHoverMode, u[38]);
+  gl.uniform3f(L.uTileHover, u[39], u[46], u[47]);
+  gl.uniform1i(L.uMirOff, u[176]);
+  gl.uniform1i(L.uMirI0, u[177]);
+  gl.uniform1i(L.uMirJ0, u[178]);
+  gl.uniform1i(L.uMirW, u[179]);
+  gl.uniform1i(L.uMirH, u[180]);
   gl.uniform4f(L.uPreview, u[40], u[41], u[42], u[43]);
   gl.uniform2f(L.uPreview2, u[44], u[45]);
   gl.uniform4fv(L.uWin, u.subarray(48, 176));
