@@ -196,9 +196,13 @@ function showPanel() {
     msgEl.textContent = `save as: ${ui.text}▏\nenter save · esc cancel`;
     return;
   }
-  const from = Math.max(0, Math.min(ui.i - 3, ui.names.length - 7));
-  const rows = ui.names.slice(from, from + 7).map((n, j) => (from + j === ui.i ? `> ${n} <` : n));
-  const hint = ui.del ? `delete "${ui.names[ui.i]}"? press delete again` : '↑↓ choose · enter load · del delete · esc close';
+  const items = [...ui.names, FILE_ROW];
+  const from = Math.max(0, Math.min(ui.i - 3, items.length - 7));
+  const rows = items.slice(from, from + 7).map((n, j) => (from + j === ui.i ? `> ${n} <` : n));
+  const onFile = ui.i === ui.names.length;
+  const hint = ui.del ? `delete "${ui.names[ui.i]}"? press delete again`
+    : onFile ? '↑↓ choose · enter pick a .room file · esc close'
+    : '↑↓ choose · enter load · e export · del delete · esc close';
   msgEl.textContent = rows.join('\n') + '\n' + hint;
 }
 function closePanel(text) {
@@ -211,10 +215,35 @@ function openSave() {
   ui = { kind: 'save', text: currentName || `room ${Object.keys(readSaves()).length + 1}` };
   showPanel();
 }
+const FILE_ROW = 'load .room file…';
+const filePicker = Object.assign(document.createElement('input'), { type: 'file', accept: '.room,text/plain', id: 'roomfile', hidden: true });
+document.body.append(filePicker);
+filePicker.addEventListener('change', async () => {
+  const f = filePicker.files[0];
+  filePicker.value = '';
+  if (!f) return;
+  const text = await f.text();
+  const name = f.name.replace(/\.room$/i, '') || 'imported room';
+  if (!loadText(text)) { msg(`"${f.name}" is not a rooms file`); return; }
+  const saves = readSaves();
+  saves[name] = { text, at: Date.now() };
+  writeSaves(saves);
+  currentName = name;
+  autosave();
+  msg(`loaded "${name}" from file`);
+});
+function exportRoom(name) {
+  const r = readSaves()[name];
+  if (!r) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([r.text], { type: 'text/plain' }));
+  a.download = `${name}.room`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
 function openLoad() {
   const saves = readSaves();
   const names = Object.keys(saves).sort((a, b) => saves[b].at - saves[a].at);
-  if (!names.length) { msg('no saved rooms yet'); return; }
   keys = 0;
   ui = { kind: 'load', names, i: Math.max(0, names.indexOf(currentName)), del: false };
   showPanel();
@@ -233,16 +262,19 @@ function panelKey(e) {
     } else if (e.key === 'Backspace') ui.text = ui.text.slice(0, -1);
     else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && ui.text.length < 40) ui.text += e.key;
   } else {
-    const n = ui.names.length;
+    const n = ui.names.length + 1; // + the "load .room file" row
+    const onFile = ui.i === ui.names.length;
     if (e.key === 'l' || e.key === 'L') { closePanel(); return; }
+    if ((e.key === 'e' || e.key === 'E') && !onFile) { exportRoom(ui.names[ui.i]); closePanel(`exported "${ui.names[ui.i]}.room"`); return; }
     if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') { ui.i = (ui.i - 1 + n) % n; ui.del = false; }
     else if (e.key === 'ArrowDown' || e.key === 'ArrowRight') { ui.i = (ui.i + 1) % n; ui.del = false; }
+    else if (e.key === 'Enter' && onFile) { closePanel(); filePicker.click(); return; }
     else if (e.key === 'Enter') {
       const name = ui.names[ui.i], r = readSaves()[name];
       if (r && loadText(r.text)) { currentName = name; autosave(); closePanel(`loaded "${name}"`); }
       else closePanel(`could not load "${name}"`);
       return;
-    } else if (e.key === 'Delete') {
+    } else if (e.key === 'Delete' && !onFile) {
       if (!ui.del) ui.del = true;
       else {
         const name = ui.names[ui.i], saves = readSaves();
@@ -250,8 +282,7 @@ function panelKey(e) {
         writeSaves(saves);
         if (currentName === name) currentName = null;
         ui.names.splice(ui.i, 1);
-        if (!ui.names.length) { closePanel(`deleted "${name}"`); return; }
-        ui.i = Math.min(ui.i, ui.names.length - 1);
+        ui.i = Math.min(ui.i, ui.names.length);
         ui.del = false;
       }
     }
@@ -264,6 +295,8 @@ const KEYS = { KeyW: 1, ArrowUp: 1, KeyS: 2, ArrowDown: 2, KeyA: 4, ArrowLeft: 4
 const MIST = [0, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.01]; // density (1/m)
 let mistIdx = 5;
 let keys = 0;
+let eHeld = false; // E: extrude mode (hover highlights the region, drag moves it with the mouse)
+function setExtrude(on) { if (on !== eHeld) { eHeld = on; X.set_extrude_hint(on ? 1 : 0); } }
 let showHelp = false;
 let preview = false;
 const brackets = new Set();
@@ -289,6 +322,7 @@ addEventListener('keydown', (e) => {
   if (KEYS[e.code]) { keys |= KEYS[e.code]; e.preventDefault(); }
   if (e.key === 'Alt') e.preventDefault(); // keep Firefox/Windows from focusing the menu bar
   if (e.key === 'Shift' && locked) setPreview(true);
+  if (e.code === 'KeyE') setExtrude(true);
   if (e.code === 'BracketLeft' || e.code === 'BracketRight') {
     brackets.add(e.code);
     if (brackets.size === 2) {
@@ -311,15 +345,17 @@ addEventListener('keyup', (e) => {
   if (KEYS[e.code]) keys &= ~KEYS[e.code];
   if (e.key === 'Alt') e.preventDefault();
   if (e.key === 'Shift') setPreview(false);
+  if (e.code === 'KeyE') setExtrude(false);
   brackets.delete(e.code);
 });
-addEventListener('blur', () => { keys = 0; brackets.clear(); setPreview(false); });
+addEventListener('blur', () => { keys = 0; brackets.clear(); setPreview(false); setExtrude(false); });
 
 // ---- mouse: pointer lock (click to capture, Esc releases); actions hit the crosshair
 const C = [0.5, 0.5];
 const SENS = 0.0025;
 let locked = false;
-let mode = null; // 'repeat' | 'shift' (click or drag undecided) | 'erase' | 'win'
+let mode = null; // 'repeat' | 'extrude' | 'shift' (click or drag undecided) | 'erase' | 'win'
+let extAcc = 0, extDist = 1; // extrude: metres of mouse travel not applied yet; distance to the surface
 let shiftMoved = 0;
 let pushDir = 1, pushStart = 0, repeatTimeout, repeatInterval;
 
@@ -329,15 +365,20 @@ function pushSteps() {
   const held = Math.max(0, (performance.now() - pushStart - 380) / 1000);
   return Math.max(1, Math.round(1 + 4 * Math.log(1 + held / 0.5)));
 }
-function doPush() {
-  const steps = mode === 'repeat' ? pushSteps() : 1;
-  let r = X.push(...C, pushDir * steps);
-  if (r !== 1 && steps > 1) r = X.push(...C, pushDir); // too far for a big step: try a small one
+function report(r) {
   if (r === 2) msg('you are in the way');
   else if (r === 3) msg("can't go further that way");
 }
+// the region pressed on is locked (grip) until mouseup, so it moves as one piece
+function doPush() {
+  const steps = mode === 'repeat' ? pushSteps() : 1;
+  let r = X.grip_step(pushDir * steps);
+  if (r !== 1 && steps > 1) r = X.grip_step(pushDir); // too far for a big step: try a small one
+  report(r);
+}
 function endAction() {
   if (mode === 'win') X.win_end();
+  X.grip_end();
   X.group_end();
   clearTimeout(repeatTimeout);
   clearInterval(repeatInterval);
@@ -348,7 +389,7 @@ document.addEventListener('pointerlockchange', () => {
   crosshair.style.display = locked ? 'block' : 'none';
   startEl.style.display = locked ? 'none' : 'block';
   X.set_hover(locked ? 0.5 : -1, locked ? 0.5 : -1);
-  if (!locked) { endAction(); keys = 0; setPreview(false); if (ui) closePanel(); } // Esc while captured
+  if (!locked) { endAction(); keys = 0; setPreview(false); setExtrude(false); if (ui) closePanel(); } // Esc while captured
 });
 document.addEventListener('pointerlockerror', () => msg('the browser refused to capture the mouse; click again'));
 
@@ -367,6 +408,8 @@ canvas.addEventListener('mousedown', (e) => {
     return;
   }
   if (e.shiftKey && e.button === 0) { mode = 'shift'; shiftMoved = 0; return; } // click: lines, drag: erase
+  if (!X.grip_begin(...C)) return; // nothing movable there (the ground)
+  if (eHeld) { mode = 'extrude'; extAcc = 0; extDist = Math.max(0.5, X.pick_dist(...C)); return; }
   pushDir = e.button === 2 ? -1 : 1;
   mode = 'repeat';
   pushStart = performance.now();
@@ -379,6 +422,19 @@ document.addEventListener('mousemove', (e) => {
   if (mode === 'shift') {
     shiftMoved += Math.abs(dx) + Math.abs(dy);
     if (shiftMoved > 6) { mode = 'erase'; X.erase(...C); }
+  }
+  if (mode === 'extrude') {
+    // the view holds still; moving the mouse up pushes the region away, down pulls it
+    // closer, faster for far surfaces, in 25 cm steps
+    extAcc += -dy * 0.006 * Math.max(1, extDist / 2.5);
+    const n = Math.trunc(extAcc / 0.25);
+    if (n !== 0) {
+      let moved = n, r = X.grip_step(n);
+      if (r !== 1 && Math.abs(n) > 1) { moved = Math.sign(n); r = X.grip_step(moved); }
+      if (r === 1) { extAcc -= moved * 0.25; extDist = Math.max(0.5, extDist + moved * 0.25); }
+      else { extAcc = 0; report(r); }
+    }
+    return;
   }
   if (mode === 'erase') {
     // sweep in small steps so fast moves don't skip line segments
@@ -404,6 +460,7 @@ const HELP = [
   ['wasd/arrows', 'walk'],
   ['click', 'push'],
   ['right click', 'pull'],
+  ['e+drag', 'extrude (drag up / down)'],
   ['shift+click', 'vertical and horizontal line'],
   ['shift+drag', 'erase lines'],
   ['alt+click', 'window, hold and aim to resize'],
@@ -455,6 +512,7 @@ function render() {
   gl.uniform4f(L.uHover, u[32], u[33], u[34], u[35]);
   gl.uniform1i(L.uHoverOff, u[36]);
   gl.uniform1i(L.uHoverN, u[37]);
+  gl.uniform1i(L.uHoverMode, u[38]);
   gl.uniform4f(L.uPreview, u[40], u[41], u[42], u[43]);
   gl.uniform2f(L.uPreview2, u[44], u[45]);
   gl.uniform4fv(L.uWin, u.subarray(48, 176));

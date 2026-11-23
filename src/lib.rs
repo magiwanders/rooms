@@ -532,6 +532,16 @@ impl Win {
     }
 }
 
+/// A region locked for a held click or an E-drag: it keeps moving as one piece even if
+/// it lines up with a neighbouring face on the way (which would otherwise merge them).
+#[derive(Clone)]
+struct Grip {
+    axis: usize,
+    s: f32,
+    pos: f32,
+    rects: Vec<[f32; 4]>,
+}
+
 /// Everything an edit can change (for undo/redo).
 #[derive(Clone)]
 struct Snap {
@@ -592,6 +602,8 @@ struct State {
     preview: bool,
     preview_at: [f32; 6],
     drag_win: Option<usize>,
+    grip: Option<Grip>,  // the region held by a click or an E-drag
+    extrude_hint: bool,  // E held: highlight the region under the crosshair differently
     ubuf: Vec<f32>,
     data: Vec<f32>,
     undo: Vec<Snap>,
@@ -628,6 +640,8 @@ impl State {
             preview: false,
             preview_at: [0.0; 6],
             drag_win: None,
+            grip: None,
+            extrude_hint: false,
             ubuf: vec![0.0; U_LEN],
             data: vec![],
             undo: vec![],
@@ -900,18 +914,26 @@ impl State {
         if h.is_ground() {
             return 0;
         }
-        let (m, s, p) = (h.axis, h.s, h.pos);
-        let (ua, va) = uva(m);
         let cells = self.region(h);
+        self.push_cells(h.axis, h.s, h.pos, cells, dir).0
+    }
+
+    /// Move the given face cells of plane (m, s, p) by `dir` steps (see push_region).
+    /// Returns the result code and the new plane position.
+    fn push_cells(&mut self, m: usize, s: f32, p: f32, cells: Vec<(usize, usize)>, dir: f32) -> (i32, f32) {
+        if m == 1 && s > 0.0 && p.abs() < EPS {
+            return (0, p);
+        }
+        let (ua, va) = uva(m);
         let mut q = p - s * STEP * dir;
         if m == 1 && q < 0.0 && p > EPS {
             q = 0.0; // a big step down stops at ground level
         }
         if (m == 1 && q < -EPS) || q.abs() > MAXD {
-            return 3;
+            return (3, p);
         }
         if self.grid.insert_cut(m, q).is_none() {
-            return 3;
+            return (3, p);
         }
         let kp = self.grid.find_cut(m, p).unwrap();
         let kq = self.grid.find_cut(m, q).unwrap();
@@ -940,16 +962,54 @@ impl State {
                     if set.contains(&(iu, iv)) {
                         w.pos = q;
                         if m == 1 && q < MIN_WIN_Y {
-                            return 3;
+                            return (3, p);
                         }
                     }
                 }
             }
         }
         if !self.body_ok(self.pos.x, self.pos.z) {
-            return 2;
+            return (2, p);
         }
-        1
+        (1, q)
+    }
+
+    /// The cells of a region as world-space rectangles (one per run of cells in a row),
+    /// so they survive grid cuts being added or removed.
+    fn cells_to_rects(&self, axis: usize, mut cells: Vec<(usize, usize)>) -> Vec<[f32; 4]> {
+        let (ua, va) = uva(axis);
+        let g = &self.grid;
+        cells.sort_by_key(|&(iu, iv)| (iv, iu));
+        let mut out = vec![];
+        let mut i = 0;
+        while i < cells.len() {
+            let (u0, iv) = cells[i];
+            let mut u1 = u0;
+            while i + 1 < cells.len() && cells[i + 1] == (u1 + 1, iv) {
+                i += 1;
+                u1 += 1;
+            }
+            out.push([g.c[ua][u0], g.c[ua][u1 + 1], g.c[va][iv], g.c[va][iv + 1]]);
+            i += 1;
+        }
+        out
+    }
+
+    /// Face cells of plane (axis, s, cut k) whose centres lie in the rectangles.
+    fn rects_to_cells(&self, axis: usize, s: f32, k: usize, rects: &[[f32; 4]]) -> Vec<(usize, usize)> {
+        let (ua, va) = uva(axis);
+        let g = &self.grid;
+        let mut out = vec![];
+        for iv in 0..g.n(va) {
+            let vm = 0.5 * (g.c[va][iv] + g.c[va][iv + 1]);
+            for iu in 0..g.n(ua) {
+                let um = 0.5 * (g.c[ua][iu] + g.c[ua][iu + 1]);
+                if rects.iter().any(|r| um > r[0] && um < r[1] && vm > r[2] && vm < r[3]) && g.is_face(axis, s, k, iu, iv) {
+                    out.push((iu, iv));
+                }
+            }
+        }
+        out
     }
 
     /// Keep only line segments that divide visible face area, i.e. with face
@@ -1188,6 +1248,7 @@ impl State {
         }
         u[31] = (self.occ_version % (1 << 20)) as f32;
         u[40..46].copy_from_slice(&self.preview_at);
+        u[38] = self.extrude_hint as u8 as f32;
         for (i, w) in self.wins.iter().enumerate() {
             let (ua, va) = uva(w.axis);
             let b = w.beam();
@@ -1349,6 +1410,80 @@ pub extern "C" fn push(sx: f32, sy: f32, dir: f32) -> i32 {
         s.wins = before.wins;
     }
     r
+}
+
+/// Press on a surface: lock its region for grip_step (held clicks, E-drag).
+/// Returns 1 if there is something to move there, 0 otherwise (e.g. the ground).
+#[no_mangle]
+pub extern "C" fn grip_begin(sx: f32, sy: f32) -> i32 {
+    let s = st();
+    s.grip = None;
+    let Some(h) = s.pick(sx, sy) else { return 0 };
+    if h.is_ground() {
+        return 0;
+    }
+    let cells = s.region(&h);
+    let rects = s.cells_to_rects(h.axis, cells);
+    s.grip = Some(Grip { axis: h.axis, s: h.s, pos: h.pos, rects });
+    1
+}
+
+/// Move the gripped region by `dir` steps of 25 cm (+ away, - toward).
+/// Same codes as push(); 0 if nothing is gripped or the region no longer exists.
+#[no_mangle]
+pub extern "C" fn grip_step(dir: f32) -> i32 {
+    let s = st();
+    let Some(g) = s.grip.clone() else { return 0 };
+    let before = s.snap();
+    // the region's edges may have been cleaned out of the grid (e.g. when it was flush
+    // with its neighbours): put them back so its cells can be found again
+    let (ua, va) = uva(g.axis);
+    for r in &g.rects {
+        for (a, x) in [(ua, r[0]), (ua, r[1]), (va, r[2]), (va, r[3])] {
+            if s.grid.insert_cut(a, x).is_none() {
+                s.restore_quiet(before);
+                return 3;
+            }
+        }
+    }
+    let Some(k) = s.grid.find_cut(g.axis, g.pos) else { return 0 };
+    let cells = s.rects_to_cells(g.axis, g.s, k, &g.rects);
+    if cells.is_empty() {
+        s.restore_quiet(before);
+        return 0;
+    }
+    let (r, q) = s.push_cells(g.axis, g.s, g.pos, cells, dir);
+    if r == 1 {
+        s.cleanup();
+        s.commit(before);
+        if let Some(gr) = s.grip.as_mut() {
+            gr.pos = q;
+        }
+    } else {
+        s.restore_quiet(before);
+    }
+    r
+}
+
+#[no_mangle]
+pub extern "C" fn grip_end() {
+    st().grip = None;
+}
+
+/// Distance to the surface under the screen point (m), or -1.
+#[no_mangle]
+pub extern "C" fn pick_dist(sx: f32, sy: f32) -> f32 {
+    st().pick(sx, sy).map_or(-1.0, |h| h.t)
+}
+
+/// E held: highlight the region under the crosshair as extrudable.
+#[no_mangle]
+pub extern "C" fn set_extrude_hint(on: i32) {
+    let s = st();
+    if s.extrude_hint != (on != 0) {
+        s.extrude_hint = on != 0;
+        s.dirty = true;
+    }
 }
 
 /// Ctrl+click: vertical = 1 adds a vertical line (screen-vertical on floors/ceilings).
@@ -2017,6 +2152,26 @@ mod tests {
         aim(v(1.5, 2.5, 0.8));
         assert_eq!(win_begin(0.5, 0.5), 2);
         win_end();
+    }
+
+    #[test]
+    fn gripped_region_keeps_moving_past_a_flush_position() {
+        setup(0.0, 0.0);
+        // a recess: line at z = 0, push the +z half back 2 steps
+        aim(v(1.5, 1.6, 0.0));
+        assert_eq!(add_line(0.5, 0.5, 1), 1);
+        aim(v(1.5, 1.6, 0.6));
+        assert_eq!(push(0.5, 0.5, 2.0), 1);
+        // grip it and pull it 4 steps: through the flush position and out into the room
+        aim(v(2.0, 1.6, 0.6));
+        assert_eq!(grip_begin(0.5, 0.5), 1);
+        for i in 0..4 {
+            let r = grip_step(-1.0);
+            assert_eq!(r, 1, "step {i}, grip {:?}", st().grip.as_ref().map(|g| (g.pos, g.rects.clone())));
+        }
+        grip_end();
+        assert!(!free(v(1.4, 1.6, 0.6)), "the gripped half now sticks out 50 cm into the room");
+        assert!(free(v(1.4, 1.6, -0.6)), "the other half of the wall did not move");
     }
 
     #[test]

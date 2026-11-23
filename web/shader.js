@@ -27,6 +27,7 @@ uniform ivec3 uN, uCutOff, uCamCell; // cut counts, their offsets in uData, came
 uniform int uNPlanes, uPlaneOff;     // plane table: (axis, sign, pos, nu, nv, off, -, -)
 uniform vec4 uHover;                 // on, axis, sign, pos
 uniform int uHoverOff, uHoverN;      // rects (u0, u1, v0, v1) in uData
+uniform int uHoverMode;              // 1 = E held: the region is ready to extrude
 uniform vec4 uPreview;               // on, axis, sign, pos
 uniform vec2 uPreview2;              // u, v
 uniform vec4 uWin[32];               // per window: (axis, sign, pos, area) (ua, va, -, -) (u0, u1, v0, v1) (sun direction, -)
@@ -209,7 +210,8 @@ vec3 albedo(Hit h, float s, vec3 p) {
     for (int i = 0; i < uHoverN; i++) {
       int o = uHoverOff + 4 * i;
       if (u >= D(o) && u <= D(o + 1) && v >= D(o + 2) && v <= D(o + 3)) {
-        a = a * vec3(0.93, 1.0, 1.12) + vec3(0.02, 0.03, 0.05);
+        a = uHoverMode == 1 ? a * vec3(1.1, 1.04, 0.92) + vec3(0.05, 0.04, 0.02)   // extrude: warm
+                            : a * vec3(0.93, 1.0, 1.12) + vec3(0.02, 0.03, 0.05);
         break;
       }
     }
