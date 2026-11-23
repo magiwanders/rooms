@@ -21,7 +21,7 @@ uniform sampler3D uOcc;    // R8, 1 = free
 uniform sampler2D uPrev;   // previous accumulation
 uniform vec2 uRes;
 uniform vec3 uPos, uF, uR, uU;
-uniform float uAspect, uTan, uAlpha, uFrame, uArea;
+uniform float uAspect, uTan, uAlpha, uFrame;
 uniform int uNWin, uNVpl, uVplOff;
 uniform ivec3 uN, uCutOff, uCamCell; // cut counts, their offsets in uData, camera cell
 uniform int uNPlanes, uPlaneOff;     // plane table: (axis, sign, pos, nu, nv, off, -, -)
@@ -39,14 +39,9 @@ const float PI = 3.14159265;
 const float INF = 1e30;
 // keep SUN / SKY in sync with src/lib.rs
 const float SUN = 4.0, SKY = 8.0, SKY_VIEW = 1.6; // SKY_VIEW: a window seen directly, times its outside light
-uniform float uSigma;          // mist density (1/m), set from the page
-#define SIGMA uSigma
 const float SUN_SPREAD = 0.06; // apparent sun size: soft edges on sunlit patches
 const float SHAFT = 45.0;      // sun strength for the light shafts in the air (stronger than on surfaces)
-// the shafts scatter a little even with no mist (dust in the air), more with mist
-#define SHAFT_SIGMA (0.012 + 3.0 * uSigma)
-const float AMB_FOG = 0.05;    // haze glow per m^2 of window
-const float FOG_BASE = 0.035;  // faint glow of the mist itself: far space fades to haze
+const float SHAFT_SIGMA = 0.012; // a little dust in the air: enough for the light shafts to show
 const vec3 SUNCOL = vec3(1.0, 0.88, 0.70);
 const vec3 SKYCOL = vec3(0.75, 0.86, 1.0);
 const int VPL_PER_PIXEL = 3;
@@ -301,9 +296,10 @@ void clip(inout float ta, inout float tb, float a, float b, float lo, float hi) 
   tb = min(tb, max(t1, t2));
 }
 
-// mist: base haze, sun shafts (marched only inside each beam's light prism), sky glow
-vec3 fog(vec3 o, vec3 d, float thit) {
-  vec3 l = vec3(0.8, 0.82, 0.85) * ((FOG_BASE + AMB_FOG * uArea) * (1.0 - exp(-SIGMA * thit)));
+// light shafts in the air: sun beams (marched only inside each beam's light prism),
+// direct and reflected off mirror tiles. The air is otherwise clear (no mist).
+vec3 shafts(vec3 o, vec3 d, float thit) {
+  vec3 l = vec3(0.0);
   int nW = min(uNWin, WIN_SAMPLES);
   float wW = float(uNWin) / float(max(nW, 1));
   for (int kw = 0; kw < nW; kw++) {
@@ -328,7 +324,7 @@ vec3 fog(vec3 o, vec3 d, float thit) {
         vec3 x = o + d * t;
         Hit h;
         if (trace(x, ld, cellAt(x), s0 + s1 * t + 0.02, h) && windowAt(h, hitSign(h, ld), x + ld * h.t) == w && sunClear(x + ld * (h.t + 2e-3), ld))
-          l += SUNCOL * (SHAFT * ph * SHAFT_SIGMA * dt * exp(-SIGMA * t));
+          l += SUNCOL * (SHAFT * ph * SHAFT_SIGMA * dt);
       }
     }
     // shafts of sunlight reflected up off mirror tiles. Unfolded through the floor, the
@@ -360,19 +356,10 @@ vec3 fog(vec3 o, vec3 d, float thit) {
           Hit h2;
           float t2 = (wpos - mp[ax]) / ld[ax];
           if (trace(mp, ld, h.cell, t2 + 0.02, h2) && windowAt(h2, hitSign(h2, ld), mp + ld * h2.t) == w && sunClear(mp + ld * (h2.t + 2e-3), ld))
-            l += SUNCOL * (SHAFT * MIRROR_R * ph * SHAFT_SIGMA * dt * exp(-SIGMA * t));
+            l += SUNCOL * (SHAFT * MIRROR_R * ph * SHAFT_SIGMA * dt);
         }
       }
     }
-    float tl = min(thit, 25.0), t = rnd() * tl;
-    vec3 x = o + d * t;
-    vec3 lv = winPoint(w, rnd(), rnd()) - x;
-    float r2 = max(dot(lv, lv), area), dist = sqrt(r2);
-    vec3 ldir = lv / dist;
-    float cw = -ws * ldir[ax];
-    Hit h;
-    if (cw > 0.0 && !trace(x, ldir, cellAt(x), dist - 0.01, h))
-      l += SKYCOL * (SKY * b.z * area * cw / r2 / (4.0 * PI) * SIGMA * tl * exp(-SIGMA * t));
     l = l0 + (l - l0) * wW;
   }
   return l;
@@ -386,8 +373,7 @@ vec3 radiance(vec3 o, vec3 d) {
     if (!trace(o, d, cell, INF, h)) return acc;
     vec3 p = o + d * h.t;
     float s = hitSign(h, d);
-    acc += thr * fog(o, d, h.t);
-    thr *= exp(-SIGMA * h.t);
+    acc += thr * shafts(o, d, h.t);
     if (bounce < 2 && h.axis == 1 && s > 0.0 && hitPos(h) < 1e-3 && isMirror(p)) {
       // a mirror tile: carry on along the reflected ray
       thr *= MIRROR;

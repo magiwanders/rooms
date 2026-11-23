@@ -292,10 +292,6 @@ function panelKey(e) {
 
 // ---- keyboard
 const KEYS = { KeyW: 1, ArrowUp: 1, KeyS: 2, ArrowDown: 2, KeyA: 4, ArrowLeft: 4, KeyD: 8, ArrowRight: 8 };
-const MIST = [0, 0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006, 0.0007, 0.0008, 0.0009, 0.001]; // density (1/m): the thickest is the old level 1
-// the mist level is remembered across reloads (it used to reset to the middle every time)
-let mistIdx = Number(localStorage.getItem('rooms.mist') ?? 2);
-if (!(mistIdx >= 0 && mistIdx < MIST.length)) mistIdx = 2;
 let keys = 0;
 let eHeld = false; // E: extrude mode (hover highlights the region, drag moves it with the mouse)
 function setExtrude(on) { if (on !== eHeld) { eHeld = on; X.set_extrude_hint(on ? 1 : 0); } }
@@ -336,13 +332,6 @@ addEventListener('keydown', (e) => {
     }
   }
   if (e.code === 'KeyH') showHelp = !showHelp;
-  const more = e.code === 'Equal' || e.code === 'NumpadAdd', less = e.code === 'Minus' || e.code === 'NumpadSubtract';
-  if ((more && mistIdx < MIST.length - 1) || (less && mistIdx > 0)) {
-    mistIdx += more ? 1 : -1;
-    try { localStorage.setItem('rooms.mist', String(mistIdx)); } catch { /* storage full */ }
-    X.invalidate();
-    msg(mistIdx === 0 ? 'no mist' : `mist ${mistIdx}/${MIST.length - 1}`);
-  }
 });
 addEventListener('keyup', (e) => {
   if (KEYS[e.code]) keys &= ~KEYS[e.code];
@@ -481,7 +470,6 @@ const HELP = [
   ['shift+click', 'vertical and horizontal line'],
   ['shift+drag', 'erase lines'],
   ['alt+click', 'window, hold and aim to resize'],
-  ['- +', 'mist'],
   ['k', 'save'],
   ['l', 'load'],
   ['n', 'new room'],
@@ -519,8 +507,6 @@ function render() {
   gl.uniform1i(L.uNWin, u[16]);
   gl.uniform1i(L.uNVpl, u[17]);
   gl.uniform1i(L.uVplOff, u[18]);
-  gl.uniform1f(L.uArea, u[19]);
-  gl.uniform1f(L.uSigma, MIST[mistIdx]);
   gl.uniform3i(L.uN, u[20], u[21], u[22]);
   gl.uniform3i(L.uCutOff, u[23], u[24], u[25]);
   gl.uniform3i(L.uCamCell, u[26], u[27], u[28]);
