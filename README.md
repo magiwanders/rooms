@@ -1,3 +1,3 @@
 # [rooms](https://rooms.magiwanders.com)
 
-![rooms](docs/screenshot.png)
+![rooms](docs/rooms.png)
