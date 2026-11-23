@@ -70,6 +70,18 @@ const U_LEN: usize = 192 + 16 * MAX_WINS; // windows from 192 on, 16 floats each
 const TILE: f32 = 0.6;
 const MIRROR_SPAN: i32 = 512;
 const MIRROR_R: f32 = 0.85; // how much light a mirror tile reflects
+/// A window's largest side is WIN_SIZE_PER_M times the height of its centre (1 m at 2 m):
+/// growing with distance from the eye, so the largest window looks about the same size
+/// on screen at any height (its area grows with the square of the height).
+const WIN_SIZE_PER_M: f32 = 0.5;
+/// Highest a room can reach: the largest ceiling window there throws a beam about as wide
+/// as the largest mirror area the renderer shows (MIRROR_SPAN tiles), so it can still be
+/// reflected in full when it reaches the floor. (512 * 0.6 m / 0.5 = 614.4 m)
+const MAX_HEIGHT: f32 = MIRROR_SPAN as f32 * TILE / WIN_SIZE_PER_M;
+/// Largest half-width / half-height of a window centred at height y.
+fn win_half_max(y: f32) -> f32 {
+    0.5 * WIN_SIZE_PER_M * y.max(0.0)
+}
 
 // ---------------------------------------------------------------- vectors
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
@@ -581,6 +593,10 @@ impl Win {
     fn area(&self) -> f32 {
         4.0 * self.hu * self.hv
     }
+    /// Height of the window's centre above the ground.
+    fn height(&self) -> f32 {
+        if self.axis == 1 { self.pos } else { self.vc }
+    }
     fn point(&self, fu: f32, fv: f32) -> V {
         let (ua, va) = uva(self.axis);
         let mut p = V::default();
@@ -1057,7 +1073,7 @@ impl State {
         if m == 1 && q < 0.0 && p > EPS {
             q = 0.0; // a big step down stops at ground level
         }
-        if (m == 1 && q < -EPS) || q.abs() > MAXD {
+        if (m == 1 && (q < -EPS || q > MAX_HEIGHT + EPS)) || q.abs() > MAXD {
             return (3, p);
         }
         if self.grid.insert_cut(m, q).is_none() {
@@ -1187,6 +1203,12 @@ impl State {
     /// Drop windows whose wall is gone (a push moved the face away from under them),
     /// so they don't linger invisibly, blocking their surface and counting toward the limit.
     fn prune_windows(&mut self) {
+        // a window moved lower (e.g. its ceiling pulled down) shrinks to the size allowed there
+        for w in &mut self.wins {
+            let cap = win_half_max(w.height()).max(0.06);
+            w.hu = w.hu.min(cap);
+            w.hv = w.hv.min(cap);
+        }
         let g = &self.grid;
         self.wins.retain(|w| {
             let (ua, va) = uva(w.axis);
@@ -1854,8 +1876,9 @@ pub extern "C" fn win_drag(sx: f32, sy: f32) {
     }
     let p = s.pos + d * t;
     let (ua, va) = uva(w.axis);
-    let hu = (p.get(ua) - w.uc).abs().clamp(0.06, 4.0);
-    let mut hv = (p.get(va) - w.vc).abs().clamp(0.06, 4.0);
+    let cap = win_half_max(w.height()).max(0.06);
+    let hu = (p.get(ua) - w.uc).abs().clamp(0.06, cap);
+    let mut hv = (p.get(va) - w.vc).abs().clamp(0.06, cap);
     if w.axis != 1 {
         hv = hv.min(w.vc - MIN_WIN_Y).max(0.02);
     }
@@ -2542,6 +2565,45 @@ mod tests {
         let s = st();
         let (north, south) = (s.outside_light(&s.wins[0]), s.outside_light(&s.wins[1]));
         assert!(north > 0.7 && (south - OUTSIDE_MIN).abs() < 1e-6, "north {north}, south {south}");
+    }
+
+    #[test]
+    fn window_size_limit_grows_with_height() {
+        setup(0.0, 0.0);
+        // on a wall at 2.5 m: at most 1.25 m wide
+        aim(v(1.5, 2.5, 0.0));
+        assert_eq!(win_begin(0.5, 0.5), 1);
+        aim(v(1.5, 2.5, 1.45)); // drag far to the side
+        win_drag(0.5, 0.5);
+        win_end();
+        let w = st().wins.last().unwrap().clone();
+        assert!((w.hu - 0.625).abs() < 1e-4, "half width {}", w.hu);
+        // raise the ceiling to 20 m: a ceiling window there may be 10 m wide
+        aim(v(-0.5, 3.0, -0.5));
+        assert_eq!(push(0.5, 0.5, 68.0), 1);
+        assert_eq!(*st().grid.c[1].last().unwrap(), 20.0);
+        aim(v(-0.5, 20.0, -0.5));
+        assert_eq!(win_begin(0.5, 0.5), 1);
+        aim(v(-1.45, 20.0, -1.45));
+        win_drag(0.5, 0.5);
+        win_end();
+        let w = st().wins.last().unwrap().clone();
+        assert!(w.hu > 0.9 && w.hu <= 5.0, "half width {}", w.hu);
+        // pulling that ceiling down to 4 m shrinks its window to fit (at most 2 m)
+        aim(v(-0.5, 20.0, -0.5));
+        assert_eq!(push(0.5, 0.5, -64.0), 1);
+        let w = st().wins.last().unwrap().clone();
+        assert!(w.hu <= 1.0 + 1e-4 && w.hv <= 1.0 + 1e-4);
+    }
+
+    #[test]
+    fn rooms_stop_at_the_height_limit() {
+        setup(0.0, 0.0);
+        assert!((MAX_HEIGHT - 614.4).abs() < 1e-3);
+        aim(v(0.5, 3.0, 0.5));
+        assert_eq!(push(0.5, 0.5, 2440.0), 1); // up to 613 m
+        aim(v(0.5, *st().grid.c[1].last().unwrap(), 0.5));
+        assert_eq!(push(0.5, 0.5, 8.0), 3, "can't go past {MAX_HEIGHT} m (615 m)");
     }
 
     #[test]
