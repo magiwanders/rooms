@@ -292,7 +292,7 @@ function panelKey(e) {
 
 // ---- keyboard
 const KEYS = { KeyW: 1, ArrowUp: 1, KeyS: 2, ArrowDown: 2, KeyA: 4, ArrowLeft: 4, KeyD: 8, ArrowRight: 8 };
-const MIST = [0, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.01]; // density (1/m)
+const MIST = [0, 0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006, 0.0007, 0.0008, 0.0009, 0.001]; // density (1/m): the thickest is the old level 1
 // the mist level is remembered across reloads (it used to reset to the middle every time)
 let mistIdx = Number(localStorage.getItem('rooms.mist') ?? 2);
 if (!(mistIdx >= 0 && mistIdx < MIST.length)) mistIdx = 2;
