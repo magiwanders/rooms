@@ -508,6 +508,7 @@ function winBegin(sx, sy) {
   else if (r === 4) msg('enough windows');
   else if (r === 5) msg('too many windows in this room');
   else if (r === 0) msg('windows go on walls or the ceiling');
+  else if (r === 6) msg('no room for a 1 × 1 m window here');
   return r === 1 || r === 2;
 }
 document.addEventListener('pointerlockchange', () => {
@@ -571,8 +572,10 @@ document.addEventListener('mouseup', () => {
 
 // ---- touch: two sticks (walk, look), push / pull buttons, and gestures on the room itself.
 // On the room: tap a wall = preview lines there, tap the preview again = cut them; drag = erase
-// lines; long press = window, keep holding and drag to size it; on the floor: mirror tile, drag paints.
+// lines; long press = window, keep holding and drag to size it; long press on a window removes it;
+// on the floor: mirror tile, drag paints.
 let look = [0, 0];       // look stick deflection
+let lookRate = [0, 0];   // ... eased toward it, so finger jitter and touch sampling don't jerk the view
 let gesture = null;      // { id, x0, y0, x, y, t0, kind: 'pending' | 'tiles' | 'erase' | 'win' | 'none' }
 let previewAt = null;    // [x, y] in css pixels of the previewed lines (touch)
 const TAP_MOVE = 12, NEAR = 40, LONG_PRESS = 450;
@@ -601,6 +604,12 @@ function checkLongPress(now) {
   const g = gesture;
   if (g?.kind !== 'pending' || now - g.t0 < LONG_PRESS) return;
   clearPreview();
+  if (X.win_delete(...toScreen(g.x0, g.y0))) { // on a window: remove it
+    g.kind = 'none';
+    navigator.vibrate?.(15);
+    msg('window removed');
+    return;
+  }
   g.kind = winBegin(...toScreen(g.x0, g.y0)) ? 'win' : 'none';
   if (g.kind === 'win') { navigator.vibrate?.(15); X.win_drag(...toScreen(g.x, g.y)); }
 }
@@ -737,7 +746,9 @@ function setupTouch() {
   });
   tap('undo', () => { closeMenu(); undo(); });
   tap('redo', () => { closeMenu(); redo(); });
-  tap('menubtn', () => (menuEl.classList.contains('open') ? closeMenu() : openMenu()));
+  tap('menubtn', openMenu);
+  tap('m-help', () => { closeMenu(); openHelp(); });
+  document.getElementById('help').addEventListener('click', (e) => { e.preventDefault(); closeHelp(); });
   tap('m-save', () => {
     closeMenu();
     const name = prompt('save as', defaultName())?.trim();
@@ -753,14 +764,21 @@ function setupTouch() {
     else { autoRes = true; updateResButton(); }
   });
 
-  msg('tap a wall: preview lines, tap again: cut · drag: erase · hold: window · floor: mirror', 6000);
+  // the first time, explain the gestures
+  try {
+    if (!localStorage.getItem(HELP_SEEN)) { openHelp(); localStorage.setItem(HELP_SEEN, '1'); }
+  } catch { openHelp(); }
 }
+const HELP_SEEN = 'rooms.touchhelp.v1';
+function openHelp() { document.getElementById('help').classList.add('open'); }
+function closeHelp() { document.getElementById('help').classList.remove('open'); }
 
 // ---- touch menu (save, load, new, screenshot, resolution) and the saved rooms list
 const menuEl = document.getElementById('menu');
 const listEl = document.getElementById('list');
-function openMenu() { menuEl.classList.add('open'); document.getElementById('menubtn').textContent = '▼'; }
-function closeMenu() { menuEl.classList.remove('open'); document.getElementById('menubtn').textContent = '▲'; }
+// the menu takes the menu button's place (tap the room or pick an item to close it)
+function openMenu() { menuEl.classList.add('open'); document.getElementById('menubtn').style.display = 'none'; }
+function closeMenu() { menuEl.classList.remove('open'); document.getElementById('menubtn').style.display = ''; }
 function updateResButton() {
   const b = document.getElementById('m-res');
   if (b) b.textContent = autoRes ? `res: auto (${RES[resIdx]}p)` : `res: ${RES[resIdx]}p`;
@@ -800,7 +818,7 @@ const HELP = [
   ['click floor', 'mirror tile, drag to paint more'],
   ['shift+click', 'vertical and horizontal line'],
   ['shift+drag', 'erase lines'],
-  ['alt+click', 'window, hold and aim to resize'],
+  ['alt+click', 'window, hold and aim to resize (whole metres)'],
   ['k', 'save'],
   ['l', 'load'],
   ['n', 'new room'],
@@ -810,10 +828,15 @@ const HELP = [
   ['[ ]', 'resolution, both together: auto'],
 ].map(([k, d]) => k.padEnd(14) + d).join('\n');
 let last = performance.now(), fpsT = last, frames = 0, fpsShown = 0, slow = 0, fast = 0, frameNo = 0;
+let peakFps = 0; // best recent frame rate: about the display's refresh rate
 
+const U_LEN = 192 + 16 * 32;
+let uView = new Float32Array(0);
 function render() {
   const w = canvas.width, h = canvas.height;
-  const u = new Float32Array(X.memory.buffer, X.frame(w, h), 192 + 16 * 32).slice();
+  const p = X.frame(w, h);
+  if (uView.buffer !== X.memory.buffer || uView.byteOffset !== p) uView = new Float32Array(X.memory.buffer, p, U_LEN); // only when wasm memory grows
+  const u = uView;
   uploadData(X.data_ptr(), X.data_len());
   uploadOcc(u[31]);
   const src = acc[frameNo & 1], dst = acc[(frameNo + 1) & 1];
@@ -891,9 +914,14 @@ function loop(now) {
   last = now;
   if (ctxLost) return;
   try {
-    if (look[0] || look[1]) {
-      const c = (a) => a * Math.abs(a); // gentle near the centre
-      X.look(c(look[0]) * LOOK_YAW * Math.min(dt, 0.1), c(look[1]) * LOOK_PITCH * Math.min(dt, 0.1));
+    if (look[0] || look[1] || lookRate[0] || lookRate[1]) {
+      const c = (a) => Math.sign(a) * Math.abs(a) ** 1.6; // gentle near the centre
+      const k = 1 - Math.exp(-Math.min(dt, 0.1) / 0.05);  // ~50 ms easing
+      for (const i of [0, 1]) {
+        lookRate[i] += (c(look[i]) - lookRate[i]) * k;
+        if (Math.abs(lookRate[i]) < 1e-4 && !look[i]) lookRate[i] = 0;
+      }
+      X.look(lookRate[0] * LOOK_YAW * Math.min(dt, 0.1), lookRate[1] * LOOK_PITCH * Math.min(dt, 0.1));
     }
     if (gesture) checkLongPress(performance.now());
     X.update(dt, keys);
@@ -910,11 +938,18 @@ function loop(now) {
     const fps = frames * 1000 / (now - fpsT);
     fpsShown = Math.round(fps);
     if (autoRes) {
-      // step down after 2 slow seconds; step back up (to 720p at most) after 3 fast ones
-      slow = fps < 27 ? slow + 1 : 0;
-      fast = fps > 55 ? fast + 1 : 0;
-      if (slow >= 2 && resIdx > 0) { resIdx--; resize(); slow = 0; }
-      else if (fast >= 3 && resIdx < autoMax) { resIdx++; resize(); fast = 0; }
+      // step down after 2 slow seconds; step back up (to 720p at most) after 3 fast ones.
+      // Touch screens aim for the display's full rate: 35-50 fps on a 60 Hz phone shows every
+      // other frame twice and judders, though the counter looks fine; a level that proved too
+      // slow there is not climbed back to.
+      peakFps = Math.max(peakFps * 0.995, fps);
+      const slowFps = touchMode ? 0.85 * Math.min(peakFps, 125) : 27, fastFps = touchMode ? 0.95 * Math.min(peakFps, 125) : 55;
+      slow = fps < slowFps ? slow + 1 : 0;
+      fast = fps > fastFps ? fast + 1 : 0;
+      if (slow >= 2 && resIdx > 0) {
+        if (touchMode) autoMax = Math.min(autoMax, resIdx - 1);
+        resIdx--; resize(); slow = 0;
+      } else if (fast >= 3 && resIdx < autoMax) { resIdx++; resize(); fast = 0; }
     }
     frames = 0;
     fpsT = now;

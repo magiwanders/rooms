@@ -75,7 +75,7 @@ const MAX_MIRRORS: usize = 200_000;
 const MIRROR_R: f32 = 0.85; // how much light a mirror tile reflects
 /// Largest window area: (WIN_SIZE_PER_M x the height of its centre)^2, i.e. 1 m^2 at 2 m,
 /// growing with the square of the height so the largest window looks about the same on
-/// screen, up to WIN_AREA_MAX. Any shape within that area.
+/// screen, up to WIN_AREA_MAX. Any shape within that area, in whole metres per side.
 const WIN_SIZE_PER_M: f32 = 0.5;
 const WIN_AREA_MAX: f32 = 100.0;
 /// Highest a room can reach (m).
@@ -83,14 +83,24 @@ const MAX_HEIGHT: f32 = 614.4;
 fn win_area_max(y: f32) -> f32 {
     (WIN_SIZE_PER_M * y.max(0.0)).powi(2).min(WIN_AREA_MAX)
 }
-/// Scale a window's half-sizes down evenly so its area fits the limit at height y.
+/// Windows are whole metres per side, at least 1 m, divided into 1 m panes by bars
+/// WIN_BAR wide (keep in sync with web/shader.js).
+const WIN_MIN: f32 = 1.0;
+const WIN_BAR: f32 = 0.06;
+/// Window half-sizes rounded to whole metres per side (at least WIN_MIN), scaled down
+/// evenly to fit the area limit at height y (any window may be 1 x 1 m).
 fn fit_window(hu: f32, hv: f32, y: f32) -> (f32, f32) {
-    let (amax, a) = (win_area_max(y).max(4.0 * 0.06 * 0.06), 4.0 * hu * hv);
-    if a <= amax {
-        return (hu, hv);
+    let (mut nu, mut nv) = ((2.0 * hu).round().max(WIN_MIN), (2.0 * hv).round().max(WIN_MIN));
+    let amax = win_area_max(y).max(WIN_MIN * WIN_MIN) + 1e-3;
+    if nu * nv > amax {
+        let f = (amax / (nu * nv)).sqrt();
+        nu = (nu * f).floor().max(WIN_MIN);
+        nv = (nv * f).floor().max(WIN_MIN);
+        while nu * nv > amax {
+            if nu >= nv { nu -= 1.0 } else { nv -= 1.0 }
+        }
     }
-    let f = (amax / a).sqrt();
-    (hu * f, hv * f)
+    (nu / 2.0, nv / 2.0)
 }
 
 // ---------------------------------------------------------------- vectors
@@ -607,6 +617,14 @@ impl Win {
     fn height(&self) -> f32 {
         if self.axis == 1 { self.pos } else { self.vc }
     }
+    /// On one of the bars between the 1 m panes (u, v on the window's plane)?
+    fn on_bar(&self, u: f32, v: f32) -> bool {
+        let bar = |x: f32, x0: f32, n: f32| {
+            let k = (x - x0).round();
+            k >= 1.0 && k <= n.round() - 1.0 && (x - x0 - k).abs() < WIN_BAR / 2.0
+        };
+        bar(u, self.uc - self.hu, 2.0 * self.hu) || bar(v, self.vc - self.hv, 2.0 * self.hv)
+    }
     fn point(&self, fu: f32, fv: f32) -> V {
         let (ua, va) = uva(self.axis);
         let mut p = V::default();
@@ -615,6 +633,16 @@ impl Win {
         p.set(va, self.vc + (2.0 * fv - 1.0) * self.hv);
         p
     }
+}
+
+/// Where a window can go: a wall or ceiling region (face cells), and its bounding box
+/// (u0, u1, v0, v1), on walls only above MIN_WIN_Y.
+#[derive(Clone)]
+struct WinSpot {
+    axis: usize,
+    pos: f32,
+    cells: HashSet<(usize, usize)>,
+    b: [f32; 4],
 }
 
 /// A region locked for a held click: it keeps moving as one piece even if
@@ -693,6 +721,7 @@ struct State {
     preview: bool,
     preview_at: [f32; 6],
     drag_win: Option<usize>,
+    drag_spot: Option<(WinSpot, (f32, f32))>, // the dragged window's surface, and the centre it grows from
     grip: Option<Grip>,  // the region held by a click
     ubuf: Vec<f32>,
     data: Vec<f32>,
@@ -717,7 +746,7 @@ impl State {
             tile_last: None,
             tile_paint: true,
             tile_hover: None,
-            wins: vec![Win { axis: 2, s: 1.0, pos: -1.5, uc: 0.25, vc: 2.62, hu: 0.32, hv: 0.18 }],
+            wins: vec![Win { axis: 2, s: 1.0, pos: -1.5, uc: 0.25, vc: 2.5, hu: 0.5, hv: 0.5 }],
             pos: v(-0.55, EYE, 1.05),
             vel: (0.0, 0.0),
             walk_t: 0.0,
@@ -735,6 +764,7 @@ impl State {
             preview: false,
             preview_at: [0.0; 6],
             drag_win: None,
+            drag_spot: None,
             grip: None,
             ubuf: vec![0.0; U_LEN],
             data: vec![],
@@ -890,6 +920,7 @@ impl State {
         self.grid = Grid { c, occ };
         self.lines = lines;
         self.wins = wins;
+        self.prune_windows(); // windows from older saves: whole metres, on their surface
         self.pos = v(px, EYE, pz);
         self.yaw = yaw;
         self.pitch = pitch.clamp(-1.45, 1.45);
@@ -994,7 +1025,15 @@ impl State {
     fn pick(&self, sx: f32, sy: f32) -> Option<Hit> {
         self.trace(self.pos, self.ray(sx, sy), INF)
     }
+/// The window the light passes through at a hit (not its bars).
     fn window_at(&self, h: &Hit) -> Option<usize> {
+        let (u, w) = h.uv();
+        self.wins.iter().position(|x| {
+            x.axis == h.axis && x.s == h.s && (x.pos - h.pos).abs() < EPS && (u - x.uc).abs() < x.hu && (w - x.vc).abs() < x.hv && !x.on_bar(u, w)
+        })
+    }
+    /// The window at a hit, bars included (what a click or a press grabs).
+    fn window_under(&self, h: &Hit) -> Option<usize> {
         let (u, w) = h.uv();
         self.wins.iter().position(|x| {
             x.axis == h.axis && x.s == h.s && (x.pos - h.pos).abs() < EPS && (u - x.uc).abs() < x.hu && (w - x.vc).abs() < x.hv
@@ -1018,11 +1057,15 @@ impl State {
     /// Face cells of the region containing the hit face cell.
     fn region(&self, h: &Hit) -> Vec<(usize, usize)> {
         let (ua, va) = uva(h.axis);
+        self.region_of(h.axis, h.s, h.k, (h.cell[ua], h.cell[va]))
+    }
+    /// Face cells of the region containing face cell `start` of plane k (sign s) on `axis`.
+    fn region_of(&self, axis: usize, s: f32, k: usize, start: (usize, usize)) -> Vec<(usize, usize)> {
+        let (ua, va) = uva(axis);
         let g = &self.grid;
         let empty = Lines::default();
-        let lines = self.lines.get(&h.key()).unwrap_or(&empty);
+        let lines = self.lines.get(&key(axis, s, g.c[axis][k])).unwrap_or(&empty);
         let (nu, nv) = (g.n(ua), g.n(va));
-        let start = (h.cell[ua], h.cell[va]);
         let mut seen = HashSet::new();
         let mut stack = vec![start];
         seen.insert(start);
@@ -1043,13 +1086,72 @@ impl State {
                 next.push((iu, iv - 1));
             }
             for c in next {
-                if !seen.contains(&c) && g.is_face(h.axis, h.s, h.k, c.0, c.1) {
+                if !seen.contains(&c) && g.is_face(axis, s, k, c.0, c.1) {
                     seen.insert(c);
                     stack.push(c);
                 }
             }
         }
         seen.into_iter().collect()
+    }
+
+    /// The surface a window at (u, v) on plane `pos` (normal sign s) of `axis` would sit on;
+    /// None if that is not a wall or ceiling face.
+    fn win_spot(&self, axis: usize, s: f32, pos: f32, u: f32, v: f32) -> Option<WinSpot> {
+        if axis == 1 && s > 0.0 {
+            return None; // floors face up
+        }
+        let (ua, va) = uva(axis);
+        let g = &self.grid;
+        let (k, iu, iv) = (g.find_cut(axis, pos)?, g.cell_of(ua, u)?, g.cell_of(va, v)?);
+        if !g.is_face(axis, s, k, iu, iv) {
+            return None;
+        }
+        let cells: HashSet<(usize, usize)> = self.region_of(axis, s, k, (iu, iv)).into_iter().collect();
+        let iu0 = cells.iter().map(|c| c.0).min()?;
+        let iu1 = cells.iter().map(|c| c.0).max()?;
+        let iv0 = cells.iter().map(|c| c.1).min()?;
+        let iv1 = cells.iter().map(|c| c.1).max()?;
+        let mut b = [g.c[ua][iu0], g.c[ua][iu1 + 1], g.c[va][iv0], g.c[va][iv1 + 1]];
+        if axis != 1 {
+            b[2] = b[2].max(MIN_WIN_Y);
+        }
+        Some(WinSpot { axis, pos, cells, b })
+    }
+
+    /// The largest whole-metre window up to nu x nv metres that fits on `spot`: within its
+    /// region, within the area limit at its height, centred as near `c` as the surface
+    /// allows. (uc, vc, hu, hv), or None if not even 1 x 1 m fits.
+    fn place_window(&self, spot: &WinSpot, c: (f32, f32), nu: f32, nv: f32) -> Option<(f32, f32, f32, f32)> {
+        let b = spot.b;
+        let (ua, va) = uva(spot.axis);
+        let g = &self.grid;
+        let fits = |r: [f32; 4]| -> bool {
+            match (g.cell_of(ua, r[0] + 1e-3), g.cell_of(ua, r[1] - 1e-3), g.cell_of(va, r[2] + 1e-3), g.cell_of(va, r[3] - 1e-3)) {
+                (Some(u0), Some(u1), Some(v0), Some(v1)) => (u0..=u1).all(|iu| (v0..=v1).all(|iv| spot.cells.contains(&(iu, iv)))),
+                _ => false,
+            }
+        };
+        let (mut nu, mut nv) = (
+            nu.round().min((b[1] - b[0] + 1e-3).floor()).max(WIN_MIN),
+            nv.round().min((b[3] - b[2] + 1e-3).floor()).max(WIN_MIN),
+        );
+        loop {
+            let uc = c.0.min(b[1] - nu / 2.0).max(b[0] + nu / 2.0);
+            let vc = c.1.min(b[3] - nv / 2.0).max(b[2] + nv / 2.0);
+            let y = if spot.axis == 1 { spot.pos } else { vc };
+            if nu <= b[1] - b[0] + 1e-3
+                && nv <= b[3] - b[2] + 1e-3
+                && nu * nv <= win_area_max(y).max(WIN_MIN * WIN_MIN) + 1e-3
+                && fits([uc - nu / 2.0, uc + nu / 2.0, vc - nv / 2.0, vc + nv / 2.0])
+            {
+                return Some((uc, vc, nu / 2.0, nv / 2.0));
+            }
+            if nu <= WIN_MIN && nv <= WIN_MIN {
+                return None;
+            }
+            if nu >= nv { nu -= 1.0 } else { nv -= 1.0 }
+        }
     }
 
     /// Move a region one STEP along its normal: dir +1 away from the viewer
@@ -1205,21 +1307,20 @@ impl State {
         self.lines.retain(|_, l| !l.is_empty());
     }
 
-    /// Drop windows whose wall is gone (a push moved the face away from under them),
-    /// so they don't linger invisibly, blocking their surface and counting toward the limit.
+    /// Keep every window on its surface: one whose wall is gone (a push moved the face away
+    /// from under it) is dropped, so it doesn't linger invisibly, blocking its surface and
+    /// counting toward the limit; one whose surface shrank, or that moved lower (a ceiling
+    /// pulled down), shrinks and shifts to what fits there, in whole metres. If not even
+    /// 1 x 1 m fits any more (a line drawn close by), it stays as it is.
     fn prune_windows(&mut self) {
-        // a window moved lower (e.g. its ceiling pulled down) shrinks to the size allowed there
-        for w in &mut self.wins {
-            (w.hu, w.hv) = fit_window(w.hu, w.hv, w.height());
-        }
-        let g = &self.grid;
-        self.wins.retain(|w| {
-            let (ua, va) = uva(w.axis);
-            match (g.find_cut(w.axis, w.pos), g.cell_of(ua, w.uc), g.cell_of(va, w.vc)) {
-                (Some(k), Some(iu), Some(iv)) => g.is_face(w.axis, w.s, k, iu, iv),
-                _ => false,
-            }
+        let mut wins = std::mem::take(&mut self.wins);
+        wins.retain_mut(|w| {
+            let Some(spot) = self.win_spot(w.axis, w.s, w.pos, w.uc, w.vc) else { return false };
+            let (hu, hv) = fit_window(w.hu, w.hv, w.height());
+            (w.uc, w.vc, w.hu, w.hv) = self.place_window(&spot, (w.uc, w.vc), 2.0 * hu, 2.0 * hv).unwrap_or((w.uc, w.vc, hu, hv));
+            true
         });
+        self.wins = wins;
     }
 
     /// How much light reaches a window from outside: more the more it faces the sun,
@@ -1282,6 +1383,10 @@ impl State {
             for k in 0..if cw > 0.0 { VPL_SUN } else { 0 } {
                 let fu = ((k % side) as f32 + rnd(&mut r)) / side as f32;
                 let fv = ((k / side) as f32 + rnd(&mut r)) / side as f32;
+                let (wp, (ua, va)) = (w.point(fu, fv), uva(w.axis));
+                if w.on_bar(wp.get(ua), wp.get(va)) {
+                    continue; // the bars between the panes shade the sun
+                }
                 if !self.grid.sun_clear(w.point(fu, fv) - nin * 2e-3, -beam) {
                     continue; // another part of the room shades this bit of the window
                 }
@@ -1878,13 +1983,19 @@ pub extern "C" fn erase(sx: f32, sy: f32) -> i32 {
 
 /// Alt+press: start a window (or grab an existing one to resize).
 /// 0 = not on a wall/ceiling, 1 = created, 2 = grabbed existing, 3 = too low,
-/// 4 = enough windows (this surface already has one), 5 = the room has MAX_WINS.
+/// 4 = enough windows (this surface already has one), 5 = the room has MAX_WINS,
+/// 6 = no room for a 1 x 1 m window on this surface.
 #[no_mangle]
 pub extern "C" fn win_begin(sx: f32, sy: f32) -> i32 {
     let s = st();
+    s.drag_spot = None;
     let Some(h) = s.pick(sx, sy) else { return 0 };
-    if let Some(i) = s.window_at(&h) {
-        s.drag_win = Some(i);
+    if let Some(i) = s.window_under(&h) {
+        let w = &s.wins[i];
+        if let Some(spot) = s.win_spot(w.axis, w.s, w.pos, w.uc, w.vc) {
+            s.drag_spot = Some((spot, (w.uc, w.vc)));
+            s.drag_win = Some(i);
+        }
         return 2;
     }
     if h.axis == 1 && h.s > 0.0 {
@@ -1906,22 +2017,27 @@ pub extern "C" fn win_begin(sx: f32, sy: f32) -> i32 {
         return 4;
     }
     let (u, w) = h.uv();
-    let low = if h.axis == 1 { h.pos < MIN_WIN_Y } else { w < MIN_WIN_Y + 0.06 };
+    let low = if h.axis == 1 { h.pos < MIN_WIN_Y } else { w < MIN_WIN_Y };
     if low {
         return 3;
     }
+    // 1 x 1 m, centred where aimed, shifted to fit the surface (above 2 m on walls)
+    let Some(spot) = s.win_spot(h.axis, h.s, h.pos, u, w) else { return 0 };
+    let Some((uc, vc, hu, hv)) = s.place_window(&spot, (u, w), WIN_MIN, WIN_MIN) else { return 6 };
     let before = s.snap();
-    s.wins.push(Win { axis: h.axis, s: h.s, pos: h.pos, uc: u, vc: w, hu: 0.06, hv: 0.06 });
+    s.wins.push(Win { axis: h.axis, s: h.s, pos: h.pos, uc, vc, hu, hv });
     s.drag_win = Some(s.wins.len() - 1);
+    s.drag_spot = Some((spot, (u, w)));
     s.commit(before);
     1
 }
 
-/// Alt+aim: resize the grabbed window around its centre.
+/// Alt+aim: resize the grabbed window around where it was started, in whole metres per
+/// side, as large as fits on its surface.
 #[no_mangle]
 pub extern "C" fn win_drag(sx: f32, sy: f32) {
     let s = st();
-    let Some(i) = s.drag_win else { return };
+    let (Some(i), Some((spot, c))) = (s.drag_win, s.drag_spot.as_ref()) else { return };
     let d = s.ray(sx, sy);
     let w = &s.wins[i];
     let da = d.get(w.axis);
@@ -1934,23 +2050,22 @@ pub extern "C" fn win_drag(sx: f32, sy: f32) {
     }
     let p = s.pos + d * t;
     let (ua, va) = uva(w.axis);
-    let (hu, mut hv) = fit_window((p.get(ua) - w.uc).abs().max(0.06), (p.get(va) - w.vc).abs().max(0.06), w.height());
-    if w.axis != 1 {
-        hv = hv.min(w.vc - MIN_WIN_Y).max(0.02);
-    }
-    if (w.hu, w.hv) == (hu, hv) {
+    let y = if w.axis == 1 { w.pos } else { c.1 };
+    let (hu, hv) = fit_window((p.get(ua) - c.0).abs(), (p.get(va) - c.1).abs(), y);
+    let Some((uc, vc, hu, hv)) = s.place_window(spot, *c, 2.0 * hu, 2.0 * hv) else { return };
+    if (w.uc, w.vc, w.hu, w.hv) == (uc, vc, hu, hv) {
         return;
     }
     let before = s.snap();
     let w = &mut s.wins[i];
-    w.hu = hu;
-    w.hv = hv;
+    (w.uc, w.vc, w.hu, w.hv) = (uc, vc, hu, hv);
     s.commit(before);
 }
 
 #[no_mangle]
 pub extern "C" fn win_end() {
     st().drag_win = None;
+    st().drag_spot = None;
 }
 
 /// Alt+right click on a window removes it.
@@ -1958,7 +2073,7 @@ pub extern "C" fn win_end() {
 pub extern "C" fn win_delete(sx: f32, sy: f32) -> i32 {
     let s = st();
     let Some(h) = s.pick(sx, sy) else { return 0 };
-    if let Some(i) = s.window_at(&h) {
+    if let Some(i) = s.window_under(&h) {
         let before = s.snap();
         s.wins.remove(i);
         s.commit(before);
@@ -2652,27 +2767,26 @@ mod tests {
         st().wins.push(Win { axis: 0, s: -1.0, pos: 1.5, uc: 0.5, vc: 2.5, hu: 0.1, hv: 0.1 });
         st().cleanup();
         assert_eq!(st().wins.len(), 2, "orphan window dropped");
-        // and its surface takes a window again: many surfaces, one window each, beyond the old limit of 8
-        let mut placed = 0;
-        for k in 0..12 {
-            let z = -1.4 + 0.25 * k as f32;
-            aim(v(1.75, 1.6, z));
-            if add_line(0.5, 0.5, 1) == 1 {
-                placed += 1;
-            }
+        // and its surface takes a window again: many surfaces, one window each, beyond the old
+        // limit of 8. Lengthen the east wall to 15 m and split it into 1.25 m strips.
+        aim(v(0.0, 1.0, -1.5));
+        assert_eq!(push(0.5, 0.5, 24.0), 1);
+        aim(v(0.0, 1.0, 1.5));
+        assert_eq!(push(0.5, 0.5, 24.0), 1);
+        for k in 1..12 {
+            aim(v(1.75, 1.6, -7.5 + 1.25 * k as f32));
+            assert_eq!(add_line(0.5, 0.5, 1), 1, "line {k}");
         }
-        assert!(placed >= 10);
-        let mut wins = 0;
+        // the first window, split by the line at z = 0, moved onto one of the middle strips
+        let mut results = vec![];
         for k in 0..12 {
-            let z = -1.4 + 0.25 * k as f32 + 0.12;
-            aim(v(1.75, 2.6, z));
-            if win_begin(0.5, 0.5) == 1 {
-                wins += 1;
-            }
+            aim(v(1.75, 2.5, -7.5 + 1.25 * (k as f32 + 0.5)));
+            results.push(win_begin(0.5, 0.5));
             win_end();
         }
-        assert!(st().wins.len() > 8, "{} windows", st().wins.len());
-        let _ = wins;
+        assert_eq!(results.iter().filter(|&&r| r == 1).count(), 11, "{results:?}");
+        assert!([results[5], results[6]].iter().any(|r| [2, 4].contains(r)), "taken (or grabbed): {results:?}");
+        assert_eq!(st().wins.len(), 13, "12 on the east wall, the starting one on the north wall");
     }
 
     #[test]
@@ -2690,27 +2804,31 @@ mod tests {
     fn window_area_limit() {
         setup(0.0, 0.0);
         let area = |w: &Win| 4.0 * w.hu * w.hv;
-        // on a wall at 2.5 m the area limit is 1.5625 m^2, any shape: a long thin window is fine
-        aim(v(1.5, 2.5, 0.0));
+        // raise the ceiling to 6 m: on the 3 m wide east wall, a window started at 4 m may
+        // have 4 m^2, any whole-metre shape: a long thin one is fine
+        aim(v(0.0, 3.0, 0.0));
+        assert_eq!(push(0.5, 0.5, 12.0), 1);
+        aim(v(1.5, 4.0, 0.0));
         assert_eq!(win_begin(0.5, 0.5), 1);
-        aim(v(1.5, 2.5, 1.45));
+        aim(v(1.5, 4.0, 1.45));
         win_drag(0.5, 0.5);
         win_end();
         let w = st().wins.last().unwrap().clone();
-        assert!((w.hu - 1.45).abs() < 1e-3, "a 2.9 m wide, thin window: half width {}", w.hu);
-        // a big drag is scaled down evenly to the area limit
+        assert_eq!((w.hu, w.hv), (1.5, 0.5), "3 x 1 m, the whole width of the wall");
+        assert!(w.uc.abs() < 1e-3, "shifted to stay on the wall: {}", w.uc);
+        // a big drag is scaled down evenly to the area limit, in whole metres: 3 x 3 -> 2 x 2
         st().wins.pop();
-        aim(v(1.5, 2.6, 0.0));
+        aim(v(1.5, 4.0, 0.0));
         assert_eq!(win_begin(0.5, 0.5), 1);
-        aim(v(1.5, 3.0, 1.45));
+        aim(v(1.5, 5.5, 1.45));
         win_drag(0.5, 0.5);
         win_end();
         let w = st().wins.last().unwrap().clone();
-        assert!((area(&w) - 1.69).abs() < 1e-3, "area {}", area(&w));
+        assert_eq!((w.hu, w.hv), (1.0, 1.0));
         // at 40 m a ceiling window would be allowed 400 m^2 by height, but stops at 100 m^2
         st().wins.pop();
-        aim(v(-0.5, 3.0, -0.5));
-        assert_eq!(push(0.5, 0.5, 148.0), 1);
+        aim(v(-0.5, 6.0, -0.5));
+        assert_eq!(push(0.5, 0.5, 136.0), 1);
         assert_eq!(*st().grid.c[1].last().unwrap(), 40.0);
         // widen the room so there is room to drag
         for (target, steps) in [(v(1.5, 1.0, 0.0), 60.0), (v(-1.5, 1.0, 0.0), 60.0), (v(0.0, 1.0, 1.5), 60.0), (v(0.0, 1.0, -1.5), 60.0)] {
@@ -2723,12 +2841,73 @@ mod tests {
         win_drag(0.5, 0.5);
         win_end();
         let w = st().wins.last().unwrap().clone();
-        assert!((area(&w) - WIN_AREA_MAX).abs() < 0.01, "area {}", area(&w));
+        assert_eq!((w.hu, w.hv), (5.0, 5.0), "10 x 10 m: {} m^2", area(&w));
         // pulling that ceiling down to 10 m shrinks the window to fit (25 m^2)
         aim(v(0.0, 40.0, 0.0));
         assert_eq!(push(0.5, 0.5, -120.0), 1);
         let w = st().wins.last().unwrap().clone();
-        assert!(area(&w) <= 25.0 + 1e-3, "area {}", area(&w));
+        assert_eq!((w.hu, w.hv), (2.5, 2.5), "5 x 5 m");
+    }
+
+    #[test]
+    fn windows_are_whole_metres_with_bars_between_panes() {
+        setup(0.0, 0.0);
+        // aimed at 2.8 m in a 3 m room: 1 x 1 m, moved down to fit under the ceiling
+        aim(v(1.5, 2.8, 0.3));
+        assert_eq!(win_begin(0.5, 0.5), 1);
+        win_end();
+        let w = st().wins.last().unwrap().clone();
+        assert_eq!((w.hu, w.hv, w.vc), (0.5, 0.5, 2.5));
+        assert!((w.uc - 0.3).abs() < 1e-3, "centred where aimed along the wall");
+        st().wins.pop();
+        // aimed at 2.1 m: moved up so the window starts at 2 m
+        aim(v(1.5, 2.1, 0.0));
+        assert_eq!(win_begin(0.5, 0.5), 1);
+        win_end();
+        assert_eq!(st().wins.last().unwrap().vc, 2.5);
+        st().wins.pop();
+        // below 2 m: refused
+        aim(v(1.5, 1.9, 0.0));
+        assert_eq!(win_begin(0.5, 0.5), 3);
+        // a strip of wall narrower than 1 m takes no window
+        aim(v(1.5, 1.6, 0.6));
+        assert_eq!(add_line(0.5, 0.5, 1), 1);
+        aim(v(1.5, 1.6, 1.2));
+        assert_eq!(add_line(0.5, 0.5, 1), 1);
+        aim(v(1.5, 2.5, 0.9));
+        assert_eq!(win_begin(0.5, 0.5), 6);
+        // bars every metre: a 3 x 1 m window has two, the panes between them are window
+        let w = Win { axis: 0, s: -1.0, pos: 1.5, uc: 0.0, vc: 2.5, hu: 1.5, hv: 0.5 };
+        assert!(w.on_bar(-0.5, 2.5) && w.on_bar(0.52, 2.2));
+        assert!(!w.on_bar(0.0, 2.5) && !w.on_bar(-1.0, 2.5) && !w.on_bar(1.4, 2.9));
+        assert!(!w.on_bar(0.0, 2.0) && !w.on_bar(0.0, 3.0), "no bar along the edges of a 1 m tall window");
+    }
+
+    #[test]
+    fn a_window_shrinks_to_its_surface_when_a_line_splits_it() {
+        setup(0.0, 0.0);
+        aim(v(0.0, 3.0, 0.0));
+        assert_eq!(push(0.5, 0.5, 12.0), 1); // 6 m ceiling
+        aim(v(1.5, 4.5, 0.0));
+        assert_eq!(win_begin(0.5, 0.5), 1);
+        aim(v(1.5, 4.5, 1.45));
+        win_drag(0.5, 0.5);
+        win_end();
+        assert_eq!(st().wins.last().unwrap().hu, 1.5, "3 m wide");
+        // a vertical line at z = 0.5 leaves 2 m of wall on the window's side
+        aim(v(1.5, 1.0, 0.5));
+        assert_eq!(add_line(0.5, 0.5, 1), 1);
+        let w = st().wins.last().unwrap().clone();
+        assert_eq!(w.hu, 1.0, "2 m wide now");
+        assert!(w.uc + w.hu <= 0.5 + 1e-3, "and on its side of the line: {} {}", w.uc, w.hu);
+        // in the 3 m starting room, a horizontal line through the north window at 2.5 m leaves
+        // less than 1 m on either side: the window stays as it is
+        setup(0.0, 0.0);
+        let before = st().wins[0].clone();
+        aim(v(-0.6, 2.5, -1.5));
+        assert_eq!(add_line(0.5, 0.5, 0), 1);
+        let w = st().wins[0].clone();
+        assert_eq!((st().wins.len(), w.hu, w.hv, w.uc, w.vc), (1, before.hu, before.hv, before.uc, before.vc));
     }
 
     #[test]

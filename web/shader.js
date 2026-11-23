@@ -47,6 +47,7 @@ const vec3 SUNCOL = vec3(1.0, 0.88, 0.70);
 const vec3 SKYCOL = vec3(0.75, 0.86, 1.0);
 const int VPL_PER_PIXEL = 3;
 const int WIN_SAMPLES = 3; // windows lighting a pixel per frame (random ones if there are more)
+const float WIN_BAR = 0.06;                  // width of the bars between window panes (src/lib.rs WIN_BAR)
 const float TILE = 0.6;                      // floor tile size (src/lib.rs TILE)
 const vec3 MIRROR = vec3(0.85, 0.87, 0.9);   // mirror tile reflectance (src/lib.rs MIRROR_R)
 const float MIRROR_R = 0.85;
@@ -157,6 +158,12 @@ vec3 glare(float c) {
 float hitSign(Hit h, vec3 d) { return d[h.axis] > 0.0 ? -1.0 : 1.0; }
 float hitPos(Hit h) { return cutv(h.axis, h.k); }
 
+// windows are whole metres, divided into 1 m panes by bars (opaque: they shade the sunlight)
+bool onBar(float x, float size) {
+  float k = round(x);
+  return k >= 1.0 && k <= round(size) - 1.0 && abs(x - k) < WIN_BAR * 0.5;
+}
+
 int windowAt(Hit h, float s, vec3 p) {
   float pos = hitPos(h);
   for (int w = 0; w < uNWin; w++) {
@@ -164,7 +171,7 @@ int windowAt(Hit h, float s, vec3 p) {
     if (int(a.x) != h.axis || a.y != s || abs(a.z - pos) > 1e-3) continue;
     vec4 b = uWin[4 * w + 1], r = uWin[4 * w + 2];
     float u = p[int(b.x)], v = p[int(b.y)];
-    if (u > r.x && u < r.y && v > r.z && v < r.w) return w;
+    if (u > r.x && u < r.y && v > r.z && v < r.w) return onBar(u - r.x, r.y - r.x) || onBar(v - r.z, r.w - r.z) ? -1 : w;
   }
   return -1;
 }

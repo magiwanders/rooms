@@ -53,14 +53,24 @@
   #undo { left: max(12px, env(safe-area-inset-left)); }
   #redo { right: max(12px, env(safe-area-inset-right)); }
   #menubtn { left: 50%; transform: translateX(-50%); bottom: max(12px, env(safe-area-inset-bottom)); width: 60px; height: 40px; border-radius: 8px; font-size: 16px !important; }
-  #menu { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(max(12px, env(safe-area-inset-bottom)) + 52px);
-          display: none; gap: 8px; }
+  #menu { position: fixed; left: 50%; transform: translateX(-50%); bottom: max(12px, env(safe-area-inset-bottom));
+          display: none; gap: 8px; flex-wrap: wrap; justify-content: center; width: max-content;
+          max-width: calc(100vw - 2 * (max(26px, env(safe-area-inset-left)) + 140px)); }
   #menu.open { display: flex; }
   #menu .ctl { position: static; height: 44px; padding: 0 14px; border-radius: 8px; background: #000a; white-space: nowrap; }
   #list { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(520px, 80vw); max-height: 78vh; overflow-y: auto;
           display: none; flex-direction: column; gap: 6px; padding: 12px; box-sizing: border-box; touch-action: pan-y;
           background: #000c; border: 1.5px solid #e8e2d055; border-radius: 10px; z-index: 5; }
   #list.open { display: flex; }
+  #help { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(600px, 84vw); max-height: 84vh; overflow-y: auto;
+          display: none; padding: 14px 18px; box-sizing: border-box; z-index: 6; touch-action: pan-y;
+          background: #000d; border: 1.5px solid #e8e2d055; border-radius: 10px; color: #e8e2d0;
+          font: 12px/1.75 ui-monospace, Menlo, Consolas, monospace; }
+  #help.open { display: block; }
+  #help table { border-collapse: collapse; width: 100%; }
+  #help td { padding: 0 0 0 0; vertical-align: top; }
+  #help td:first-child { color: #f3e6c4; white-space: nowrap; padding-right: 16px; }
+  #help .close { text-align: center; color: #e8e2d090; padding-top: 8px; }
   #list .title { color: #f3e6c4; font: 13px ui-monospace, Menlo, Consolas, monospace; text-align: center; padding-bottom: 4px; }
   #list .row { display: flex; gap: 6px; }
   #list button { height: 42px; border: 1.5px solid #e8e2d055; background: #e8e2d00f; color: #e8e2d0d0; border-radius: 6px;
@@ -96,6 +106,23 @@
     <button id="m-new" class="ctl">new</button>
     <button id="m-shot" class="ctl">screenshot</button>
     <button id="m-res" class="ctl">res: auto</button>
+    <button id="m-help" class="ctl">help</button>
+  </div>
+  <div id="help">
+    <table>
+      <tr><td>left stick</td><td>walk</td></tr>
+      <tr><td>right stick</td><td>look around</td></tr>
+      <tr><td>push / pull</td><td>move the surface under the crosshair; hold to keep going</td></tr>
+      <tr><td>tap a wall</td><td>preview a vertical and a horizontal line there</td></tr>
+      <tr><td>tap it again</td><td>cut along the previewed lines</td></tr>
+      <tr><td>drag on a wall</td><td>erase lines</td></tr>
+      <tr><td>long press</td><td>window on a wall or the ceiling; keep holding and drag to size it (whole metres)</td></tr>
+      <tr><td>long press a window</td><td>remove it</td></tr>
+      <tr><td>tap the floor</td><td>mirror tile; drag to paint more</td></tr>
+      <tr><td>↶ ↷</td><td>undo, redo</td></tr>
+      <tr><td>▲</td><td>save, load, new room, screenshot, resolution, this help</td></tr>
+    </table>
+    <div class="close">tap to close</div>
   </div>
   <div id="list"></div>
 </div>
