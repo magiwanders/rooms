@@ -412,7 +412,7 @@ canvas.addEventListener('mousedown', (e) => {
     return;
   }
   if (e.shiftKey && e.button === 0) { mode = 'shift'; shiftMoved = 0; return; } // click: lines, drag: erase
-  const t = X.tile_begin(...C); // on the floor: toggle mirror tiles, dragging toggles every tile entered
+  const t = X.tile_begin(...C); // on the floor: toggle a mirror tile, dragging paints the same onto more tiles
   if (t) { if (t === 3) msg('mirrors too far apart'); mode = 'tiles'; return; }
   if (!X.grip_begin(...C)) return;
   if (eHeld) { mode = 'extrude'; extAcc = 0; extDist = Math.max(0.5, X.pick_dist(...C)); return; }
@@ -476,7 +476,7 @@ const HELP = [
   ['click', 'push'],
   ['right click', 'pull'],
   ['e+drag', 'extrude (drag up / down)'],
-  ['click floor', 'mirror tile (drag: more tiles)'],
+  ['click floor', 'mirror tile, drag to paint more'],
   ['shift+click', 'vertical and horizontal line'],
   ['shift+drag', 'erase lines'],
   ['alt+click', 'window, hold and aim to resize'],

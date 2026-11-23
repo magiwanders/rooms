@@ -644,7 +644,8 @@ struct State {
     lines: HashMap<Key, Lines>,
     wins: Vec<Win>,
     mirrors: HashSet<(i32, i32)>, // floor tiles that are mirrors
-    tile_last: Option<(i32, i32)>, // tile toggled last during a click-drag
+    tile_last: Option<(i32, i32)>, // tile under the crosshair last during a click-drag
+    tile_paint: bool,              // what the first click made its tile (mirror or not): a drag paints that
     tile_hover: Option<(i32, i32)>,
     pos: V,
     vel: (f32, f32), // horizontal velocity (x, z)
@@ -685,6 +686,7 @@ impl State {
             lines: HashMap::new(),
             mirrors: HashSet::new(),
             tile_last: None,
+            tile_paint: true,
             tile_hover: None,
             wins: vec![Win { axis: 2, s: 1.0, pos: -1.5, uc: 0.25, vc: 2.62, hu: 0.32, hv: 0.18 }],
             pos: v(-0.55, EYE, 1.05),
@@ -917,9 +919,13 @@ impl State {
     fn ground_tile(&self, sx: f32, sy: f32) -> Option<(i32, i32)> {
         self.pick(sx, sy).filter(|h| h.is_ground()).map(|h| State::tile_of(h.p))
     }
-    /// Toggle a tile; false if it would make the mirror area too large to send.
-    fn toggle_tile(&mut self, t: (i32, i32)) -> bool {
-        if !self.mirrors.contains(&t) && !self.mirrors.is_empty() {
+    /// Make a tile a mirror (on) or plain floor; false if it would make the mirror area
+    /// too large to send. No-op (true) if it already is.
+    fn set_tile(&mut self, t: (i32, i32), on: bool) -> bool {
+        if self.mirrors.contains(&t) == on {
+            return true;
+        }
+        if on && !self.mirrors.is_empty() {
             let (mut i0, mut i1, mut j0, mut j1) = (t.0, t.0, t.1, t.1);
             for &(i, j) in &self.mirrors {
                 i0 = i0.min(i);
@@ -932,8 +938,10 @@ impl State {
             }
         }
         let before = self.snap();
-        if !self.mirrors.remove(&t) {
+        if on {
             self.mirrors.insert(t);
+        } else {
+            self.mirrors.remove(&t);
         }
         self.commit(before);
         true
@@ -1572,11 +1580,13 @@ pub extern "C" fn tile_begin(sx: f32, sy: f32) -> i32 {
     s.tile_last = None;
     let Some(t) = s.ground_tile(sx, sy) else { return 0 };
     s.tile_last = Some(t);
-    if s.toggle_tile(t) { 1 } else { 3 }
+    s.tile_paint = !s.mirrors.contains(&t);
+    let paint = s.tile_paint;
+    if s.set_tile(t, paint) { 1 } else { 3 }
 }
 
-/// Dragging after tile_begin: every tile the crosshair enters is toggled (entering a
-/// tile again toggles it again). Returns 1 if a tile was toggled.
+/// Dragging after tile_begin paints: every tile the crosshair passes becomes what the
+/// first click made its tile (passing a tile again changes nothing). 1 if one changed.
 #[no_mangle]
 pub extern "C" fn tile_drag(sx: f32, sy: f32) -> i32 {
     let s = st();
@@ -1585,10 +1595,10 @@ pub extern "C" fn tile_drag(sx: f32, sy: f32) -> i32 {
         return 0;
     }
     s.tile_last = t;
-    match t {
-        Some(t) => s.toggle_tile(t) as i32,
-        None => 0,
-    }
+    let Some(t) = t else { return 0 };
+    let changed = s.mirrors.contains(&t) != s.tile_paint;
+    let paint = s.tile_paint;
+    (s.set_tile(t, paint) && changed) as i32
 }
 
 #[no_mangle]
@@ -2396,22 +2406,35 @@ mod tests {
         group_begin();
         assert_eq!(tile_begin(0.5, 0.5), 1);
         assert!(st().mirrors.contains(&(1, 0)));
-        // sweep onto the next tile, back, and on again: each entry toggles
+        // the drag paints mirrors: onto the next tile, and back onto the first changes nothing
         aim(v(0.3, 0.0, 0.3)); // tile (0, 0)
         assert_eq!(tile_drag(0.5, 0.5), 1);
         aim(v(0.31, 0.0, 0.32)); // same tile: nothing
         assert_eq!(tile_drag(0.5, 0.5), 0);
-        aim(v(0.9, 0.0, 0.3)); // back onto (1, 0): toggled off again
-        assert_eq!(tile_drag(0.5, 0.5), 1);
+        aim(v(0.9, 0.0, 0.3)); // back onto (1, 0): already a mirror, stays one
+        assert_eq!(tile_drag(0.5, 0.5), 0);
         tile_end();
         group_end();
-        assert!(st().mirrors.contains(&(0, 0)) && !st().mirrors.contains(&(1, 0)));
+        assert!(st().mirrors.contains(&(0, 0)) && st().mirrors.contains(&(1, 0)));
+        // starting on a mirror erases instead: the drag clears tiles it passes
+        aim(v(0.3, 0.0, 0.3));
+        group_begin();
+        assert_eq!(tile_begin(0.5, 0.5), 1);
+        aim(v(0.9, 0.0, 0.3));
+        assert_eq!(tile_drag(0.5, 0.5), 1);
+        aim(v(1.5 - 0.01, 0.0, 0.3)); // tile (2, 0): plain floor, stays plain
+        assert_eq!(tile_drag(0.5, 0.5), 0);
+        tile_end();
+        group_end();
+        assert!(st().mirrors.is_empty());
+        assert_eq!(undo(), 1);
+        assert!(st().mirrors.contains(&(0, 0)) && st().mirrors.contains(&(1, 0)));
         // walls are not tiles
         aim(v(1.5, 1.6, 0.0));
         assert_eq!(tile_begin(0.5, 0.5), 0);
         // saved with the room, and the whole sweep is one undo step
         let text = st().serialize();
-        assert!(text.trim_end().ends_with("1 0 0"));
+        assert!(text.trim_end().ends_with("2 0 0 1 0"));
         assert_eq!(undo(), 1);
         assert!(st().mirrors.is_empty());
         // older saves without the mirror section still load
